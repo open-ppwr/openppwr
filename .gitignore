@@ -1,0 +1,35 @@
+.work-private/
+node_modules/
+dist/
+build/
+coverage/
+artifacts/
+.runtime/
+.runtime-test/
+uploads/
+storage/
+logs/
+tmp/
+temp/
+.env
+.env.*
+# `deploy/community/openppwr.env` is the file the deployment documentation tells every operator to create,
+# and it holds the database, worker and bootstrap credentials of a live stack. It is not `.env` and does not
+# start with `.env`, so neither rule above covered it: `git check-ignore` returned "not ignored". Its
+# directory is publicly exported, so a single `git add -A` on a deployment host would have committed live
+# secrets into the release. Ignore any name ending in `.env`, not only the dotfile forms.
+*.env
+!.env.example
+!*.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+*.dump
+*.backup
+*.bak
+*.log
+apps/web/public/downloads/
+artifacts/reporting/

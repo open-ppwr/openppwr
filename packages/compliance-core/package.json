@@ -1,0 +1,1 @@
+{"name":"@openppwr/core","version":"1.0.0","private":true,"license":"Apache-2.0","type":"module","exports":"./src/index.mjs","scripts":{"lint":"node --check src/index.mjs","typecheck":"node --check src/index.mjs","test":"node --test test/core.test.mjs","test:unit":"npm test","build":"node --check src/index.mjs"}}

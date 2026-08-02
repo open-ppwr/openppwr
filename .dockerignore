@@ -1,0 +1,11 @@
+.git
+.github
+.work-private
+node_modules
+artifacts
+.runtime*
+coverage
+dist
+*.log
+.env*
+docs/commercial

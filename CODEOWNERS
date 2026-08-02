@@ -1,0 +1,14 @@
+# Team creation/membership must be confirmed before GitHub protection is enabled.
+* @open-ppwr/maintainers
+/docs/security/ @open-ppwr/security
+/packages/security/ @open-ppwr/security
+/docs/regulatory/ @open-ppwr/regulatory
+/docs/architecture/ADR/ @open-ppwr/architecture
+/LICENSE @open-ppwr/legal
+/NOTICE @open-ppwr/legal
+/THIRD_PARTY_NOTICES.md @open-ppwr/legal
+/TRADEMARKS.md @open-ppwr/legal
+/DCO.md @open-ppwr/legal
+/CONTRIBUTING.md @open-ppwr/legal
+/docs/audit/*LICENSE* @open-ppwr/legal
+/scripts/release/generate-third-party-inventory.mjs @open-ppwr/legal

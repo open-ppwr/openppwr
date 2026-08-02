@@ -1,0 +1,19 @@
+{
+  "name": "@openppwr/dossier",
+  "version": "1.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "dependencies": {
+    "@openppwr/evidence": "1.0.0",
+    "dejavu-fonts-ttf": "^2.37.3",
+    "pdfkit": "^0.19.1"
+  },
+  "scripts": {
+    "lint": "node --check src/index.mjs",
+    "typecheck": "node --check src/index.mjs",
+    "test:unit": "node --test test/index.test.mjs test/locale-glyphs.test.mjs",
+    "build": "node --check src/index.mjs"
+  }
+}

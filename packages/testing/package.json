@@ -1,0 +1,14 @@
+{
+  "name": "@openppwr/testing",
+  "version": "1.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "scripts": {
+    "build": "node --check src/index.mjs",
+    "lint": "node --check src/index.mjs",
+    "typecheck": "node --check src/index.mjs",
+    "test:unit": "node --test test/index.test.mjs"
+  }
+}

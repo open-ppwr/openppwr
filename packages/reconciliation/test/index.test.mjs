@@ -1,0 +1,1 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {reconcile} from '../src/index.mjs';test('reconciliation raportuje różnicę',()=>assert.equal(reconcile({sourceCount:1,accepted:1,sourceTotal:2,targetTotal:1}).status,'WYMAGA_WYJAŚNIENIA'));

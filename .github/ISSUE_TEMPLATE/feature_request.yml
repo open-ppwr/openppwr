@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Feature or idea
+description: Propose a change to what OpenPPWR Community does.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Community is the self-hosted Apache-2.0 workflow. Maintained regulatory rule packs, managed
+        operation, ERP connectors and advanced identity controls belong to separate commercial editions
+        and are out of scope here — see `docs/architecture/OPEN_CORE_BOUNDARY.md`.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and where does the product stop you? Describe the situation, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: What should happen instead. If you have a workaround, say what it costs you to keep using it.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Packaging, materials and bills of material
+        - Suppliers and evidence
+        - Assessment, gaps and remediation
+        - Review snapshots and dossiers
+        - Deployment, installer and operations
+        - API and integration
+        - Documentation or translation
+        - Other, described above
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: This sits inside the Community boundary rather than asking for a commercial edition capability.
+          required: true
+        - label: This description names no customer material or private infrastructure.
+          required: true

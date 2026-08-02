@@ -1,0 +1,399 @@
+# SPDX-License-Identifier: Apache-2.0
+name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}
+
+x-app: &app
+  image: ${OPENPPWR_IMAGE:?Set an immutable OpenPPWR image reference}
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 256
+  # Container logs go to the host journal, and that move is what makes a time-based retention period
+  # expressible at all. Docker's json-file driver evicts by size and has no age option: nothing writable
+  # in this file discards a log for being thirty-one days old, so the previous max-size/max-file pair was
+  # a volume promise wearing a retention period's clothes. journald has MaxRetentionSec, so the control
+  # moves to the one place it can exist -- a host drop-in the installer writes at
+  # /etc/systemd/journald.conf.d/10-openppwr-retention.conf (`openppwr-installer journal-retention`).
+  #
+  # Read the promise it makes before relying on it. journald bounds by age AND by size and applies both,
+  # so the shipped configuration is "30 days or 1 GB, whichever comes first" and not "30 days".
+  #
+  # The tag is what makes one service selectable: `journalctl -t openppwr-community.api`. It carries the
+  # compose project name because two independent stacks on one host share a single journal, and a tag of
+  # `api` alone would merge them into one stream. Every service names its own below rather than
+  # inheriting this one, so a service added without a tag is a visible omission rather than a stream that
+  # silently merges into another service's. This anchor value is the fallback such a service would get:
+  # journald with a coarse tag, never json-file.
+  logging:
+    driver: journald
+    options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.app"}
+
+services:
+  postgres:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openppwr
+      POSTGRES_USER: openppwr_migrator
+      POSTGRES_PASSWORD: ${OPENPPWR_DB_PASSWORD:?Set OPENPPWR_DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    tmpfs:
+      - /var/run/postgresql:rw,noexec,nosuid,size=16m
+      - /tmp:rw,noexec,nosuid,size=64m
+    # Never inherited the application anchor's hardening at all — the container holding every
+    # tenant's data ran with its default capability set while every application container had it dropped
+    # to nothing. `no-new-privileges` costs nothing here. `CHOWN`/`FOWNER`/`SETUID`/`SETGID`/`DAC_OVERRIDE`
+    # are what the official entrypoint's own permission-fixing step needs on first run against a fresh
+    # volume; verified this still initializes and starts against a genuinely empty volume, not only an
+    # already-initialized one.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U openppwr_migrator -d openppwr"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    shm_size: 256m
+    mem_limit: 1g
+    cpus: 1.5
+    pids_limit: 256
+    logging:
+      driver: journald
+      options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.postgres"}
+
+  clamav:
+    image: clamav/clamav:1.4@sha256:6b7c8e09559250f25b0184516b0a2ae805136e57485260e16c780c9fd6e6aba9
+    restart: unless-stopped
+    volumes:
+      - clamav-data:/var/lib/clamav
+    tmpfs:
+      - /run:rw,noexec,nosuid,size=16m
+      - /tmp:rw,noexec,nosuid,size=64m
+    # Never inherited the application anchor's hardening at all — the container that parses
+    # attacker-controlled evidence bytes for a living ran with its default capability set. `CHOWN`/
+    # `DAC_OVERRIDE`/`SETUID`/`SETGID` are what its own entrypoint needs to fix ownership on the signature
+    # volume on first run; verified this still starts and reaches healthy against a genuinely empty volume.
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
+    networks: [scanner, scanner-egress]
+    healthcheck:
+      test: [CMD-SHELL, "clamdscan --ping 1 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 10
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 512
+    logging:
+      driver: journald
+      options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.clamav"}
+
+  migrate:
+    <<: *app
+    restart: "no"
+    logging:
+      driver: journald
+      options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.migrate"}
+    command: [packages/database/src/prepare.mjs]
+    environment:
+      OPENPPWR_MIGRATION_DATABASE_URL: postgres://openppwr_migrator:${OPENPPWR_DB_PASSWORD}@postgres/openppwr
+      OPENPPWR_RUNTIME_DATABASE_PASSWORD: ${OPENPPWR_RUNTIME_DATABASE_PASSWORD:?Set runtime database password}
+      # Migration 014 creates openppwr_auth and openppwr_maintenance without a password. They become
+      # usable here, each with its own, and prepare.mjs refuses a password reused between principals:
+      # shared credentials leave the grants separated while the capability is not.
+      #
+      # Both are optional. A deployment holding real data sets neither, and password sign-in and the
+      # environment reset then do not exist rather than existing with a default.
+      OPENPPWR_AUTH_DATABASE_PASSWORD: ${OPENPPWR_AUTH_DATABASE_PASSWORD:-}
+      OPENPPWR_MAINTENANCE_DATABASE_PASSWORD: ${OPENPPWR_MAINTENANCE_DATABASE_PASSWORD:-}
+      # Migration 035 creates openppwr_rotation without a password, the same way. Unlike the two above it is
+      # meant for a deployment holding real data: it holds EXECUTE on the rotation function and nothing else,
+      # and that EXECUTE grants nothing to a caller that cannot present a live credential. Set it and a
+      # leaked bearer token can be replaced; leave it unset and prepare.mjs retires the role, so the only
+      # recovery from a leaked credential is the migration credential on the host.
+      OPENPPWR_ROTATION_DATABASE_PASSWORD: ${OPENPPWR_ROTATION_DATABASE_PASSWORD:-}
+      OPENPPWR_WORKER_DATABASE_PASSWORD: ${OPENPPWR_WORKER_DATABASE_PASSWORD:?Set worker database password}
+      # How long this step may spend establishing its database connection, not how long a migration may
+      # take. It defaults to 30 seconds in the code and is exposed here so a deployment whose database is
+      # slower to authenticate can raise it. There is deliberately no statement bound: a migration may hold
+      # a lock or build an index for a long time on a large database, and cancelling one halfway turns an
+      # upgrade that would have finished into one that reports failure.
+      OPENPPWR_DB_CONNECT_TIMEOUT_MS: ${OPENPPWR_DB_CONNECT_TIMEOUT_MS:-}
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [data]
+
+  api:
+    <<: *app
+    logging:
+      driver: journald
+      options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.api"}
+    environment:
+      OPENPPWR_DATABASE_URL: postgres://openppwr_app:${OPENPPWR_RUNTIME_DATABASE_PASSWORD}@postgres/openppwr
+      OPENPPWR_BOOTSTRAP_TOKEN: ${OPENPPWR_BOOTSTRAP_TOKEN:?Set bootstrap token}
+      OPENPPWR_EVIDENCE_STORAGE_ROOT: /var/lib/openppwr/evidence
+      OPENPPWR_SERVE_WEB: "false"
+      # Demonstration sign-in. Absent by default, which leaves it off: the API treats anything other
+      # than "true" as disabled. Without these the container could not see the operator's decision at
+      # all, so the credentials panel and the environment reset were unreachable on a deployment that
+      # had enabled them in its environment file.
+      OPENPPWR_DEMO_LOGIN: ${OPENPPWR_DEMO_LOGIN:-}
+      OPENPPWR_DEMO_PASSWORD: ${OPENPPWR_DEMO_PASSWORD:-}
+      OPENPPWR_DEMO_EMAIL_DOMAIN: ${OPENPPWR_DEMO_EMAIL_DOMAIN:-}
+      # Sign-in reads a password verifier and mints a session; the reset deletes a tenant's data. Neither
+      # capability belongs to the role that serves requests, so each arrives on its own credential and the
+      # API verifies at startup that every pool connects as the principal its variable names.
+      #
+      # Left empty these are absent, and the capability does not exist. A production deployment therefore
+      # never loads the maintenance credential into the request-serving process at all -- which is the
+      # property that matters, since the two capabilities are reachable from HTTP by design.
+      OPENPPWR_AUTH_DATABASE_URL: ${OPENPPWR_AUTH_DATABASE_PASSWORD:+postgres://openppwr_auth:${OPENPPWR_AUTH_DATABASE_PASSWORD}@postgres/openppwr}
+      OPENPPWR_MAINTENANCE_DATABASE_URL: ${OPENPPWR_MAINTENANCE_DATABASE_PASSWORD:+postgres://openppwr_maintenance:${OPENPPWR_MAINTENANCE_DATABASE_PASSWORD}@postgres/openppwr}
+      # The exception to the paragraph above, and the only one. Replacing a leaked bearer token is a recovery
+      # story a production deployment needs and the two credentials above cannot provide, because the API
+      # refuses to start holding either. openppwr_rotation is that capability on a principal narrow enough to
+      # load here: the rotation function, no session issuance, no password verifier, no table grant. The API
+      # verifies at startup that this URL connects as openppwr_rotation and not as something wider.
+      OPENPPWR_ROTATION_DATABASE_URL: ${OPENPPWR_ROTATION_DATABASE_PASSWORD:+postgres://openppwr_rotation:${OPENPPWR_ROTATION_DATABASE_PASSWORD}@postgres/openppwr}
+      OPENPPWR_IMAGE_DIGEST: ${OPENPPWR_IMAGE_DIGEST:-}
+      # The browser origins the API will answer. Absent means the built-in list, which names this project's
+      # own hostnames and therefore no self-hoster's.
+      #
+      # Named here because it was not, and the omission made the documented escape hatch inert: the API reads
+      # OPENPPWR_CORS_ALLOWED_ORIGINS, `openppwr.env.example` did not mention it, and `--env-file` only
+      # supplies values for this file's own `${...}` interpolation — it never injects a variable into a
+      # container. So an operator who found the setting, set it correctly, and restarted saw no change, with
+      # nothing to distinguish "wrong value" from "never delivered". Same defect the host-map variables had.
+      #
+      # Usually unnecessary now: the same-origin path works once `web` forwards the real scheme, which it
+      # does. This is for the cases same-origin cannot cover -- a separate front-end origin, or an operator
+      # who wants the answer pinned explicitly rather than derived.
+      OPENPPWR_CORS_ALLOWED_ORIGINS: ${OPENPPWR_CORS_ALLOWED_ORIGINS:-}
+      # Where security events go besides stdout. All five are absent by default and absent means off:
+      # nothing is sent, nothing is attempted, and the API says nothing about alerting at all. Naming
+      # them here is not optional even so -- `--env-file` only supplies values for this file's own
+      # `${...}` interpolation and never injects a variable into a container, so a setting in
+      # openppwr.env has no effect until the variable appears in this block.
+      #
+      # Delivery is bounded and never on the request path. If the destination is slow, unreachable or
+      # answering 500, the request it describes is unaffected, the event is still on stdout, and the
+      # alert is dropped and counted. See openppwr.env.example for what each variable does.
+      #
+      # NOTE ON REACHABILITY: `api` is on two internal networks, so a destination outside this
+      # deployment is not reachable from it by default. That is deliberate -- the request-serving
+      # container has no outbound path. Compose the stack with docker-compose.alerting.yml to grant one.
+      OPENPPWR_ALERT_WEBHOOK_URL: ${OPENPPWR_ALERT_WEBHOOK_URL:-}
+      OPENPPWR_ALERT_WEBHOOK_TOKEN: ${OPENPPWR_ALERT_WEBHOOK_TOKEN:-}
+      OPENPPWR_ALERT_MIN_LEVEL: ${OPENPPWR_ALERT_MIN_LEVEL:-}
+      OPENPPWR_ALERT_TIMEOUT_MS: ${OPENPPWR_ALERT_TIMEOUT_MS:-}
+      OPENPPWR_ALERT_MAX_IN_FLIGHT: ${OPENPPWR_ALERT_MAX_IN_FLIGHT:-}
+      # The same events, by e-mail. A second, independent transport: configure either, both, or neither.
+      # Absent means off, exactly as the webhook variables above. Not exclusive with the webhook -- a
+      # dead mail relay must not be able to stop the webhook from delivering, so the in-flight ceiling
+      # below is counted per transport rather than shared.
+      OPENPPWR_ALERT_DEPLOYMENT: ${OPENPPWR_ALERT_DEPLOYMENT:-}
+      OPENPPWR_ALERT_SMTP_HOST: ${OPENPPWR_ALERT_SMTP_HOST:-}
+      OPENPPWR_ALERT_SMTP_PORT: ${OPENPPWR_ALERT_SMTP_PORT:-}
+      OPENPPWR_ALERT_SMTP_TLS: ${OPENPPWR_ALERT_SMTP_TLS:-}
+      OPENPPWR_ALERT_SMTP_USERNAME: ${OPENPPWR_ALERT_SMTP_USERNAME:-}
+      OPENPPWR_ALERT_SMTP_PASSWORD: ${OPENPPWR_ALERT_SMTP_PASSWORD:-}
+      OPENPPWR_ALERT_EMAIL_FROM: ${OPENPPWR_ALERT_EMAIL_FROM:-}
+      OPENPPWR_ALERT_EMAIL_TO: ${OPENPPWR_ALERT_EMAIL_TO:-}
+      OPENPPWR_ALERT_EMAIL_MAX_PER_HOUR: ${OPENPPWR_ALERT_EMAIL_MAX_PER_HOUR:-}
+      # Database deadlines. INTERACTIVE is absent by default and absent means unbounded, which is exactly
+      # what this deployment did before it existed -- so leaving it unset changes nothing. EXTENDED and
+      # CHECKOUT now ship real defaults, below.
+      #
+      # They are named here because they were previously not, which was half the reason the risk stayed
+      # open: `--env-file` only supplies values for this file's own `${...}` interpolation and never
+      # injects a variable into a container, so a deployment could not tune a deadline even where one
+      # existed. It can now.
+      #
+      # Measured against a representative tenant (3 000 packaging records, 60 suppliers, 60 materials, 400
+      # components, 4 200 BOM lines, 18 338 audit events built through real import/assessment/gap/reassess
+      # writes rather than seeded rows -- scripts/testing/synthetic-scale-tenant.mjs and
+      # scripts/testing/deadline-scale-measurement.mjs), not the 32-record ACME fixture this file used to
+      # cite. What that measurement supports differs by variable:
+      #
+      # EXTENDED bounds a single statement inside freezeReviewSnapshot, generateDossier and
+      # verifyAuditChain -- the operations that walk a whole tenant, marked as a separate class so one
+      # number does not have to serve both this and an ordinary request. Those three issue many cheap
+      # statements (the per-event audit-hash recompute: median 0.124 ms, max 3.2 ms even at 50 000 events)
+      # and a handful of whole-snapshot ones that are not per-event -- the review_snapshots insert, the
+      # snapshot read-back, the initial audit-event fetch -- which topped out at 134 ms across two full
+      # runs at this tenant's size. 2000 ms is roughly 15x that measured worst case: about 3x for headroom
+      # up to 5 000 packaging records (the top of the size range this measurement's own brief gave), about
+      # 2x because only two full runs measured this specific statement directly, and a further ~2.5x
+      # because this measurement ran with no concurrent database load, which a real deployment will have.
+      # Re-measure and raise this if your catalogue is substantially larger than a few thousand packaging
+      # records -- these statements scale with current catalogue size, not with audit history length.
+      #
+      # INTERACTIVE bounds a single statement in an ordinary authenticated read or write, and stays unset:
+      # this measurement did not instrument the ordinary CRUD routes it would need to. The two problems
+      # that made guessing one anyway a bad idea -- GET /v1/assessments and GET /v1/gaps returning every
+      # row with no LIMIT, and runAssessments (reached from POST /v1/gaps/:id/reassess too) looping the
+      # whole packaging catalogue inside one interactive-class transaction -- are both fixed as of
+      # 2026-08-01 (the two routes now paginate; runAssessments is reclassified as extended, below), but
+      # that does not manufacture the measurement this class still lacks. It stays unset until an ordinary
+      # CRUD route is actually timed.
+      #
+      # CHECKOUT bounds waiting for a pooled connection. packages/database/src/index.mjs states the tension
+      # in detail: the pool holds ten connections, a real freezeReviewSnapshot, generateDossier or (as of
+      # 2026-08-01) runAssessments holds one for the whole operation -- 0.4-3.2 s at this tenant's size, up
+      # to roughly 10 s by the audit-chain curve at 50 000 events -- and the measured checkout curve --
+      # concurrency 10 (exactly filling the pool): 205 ms p95; 20: 356 ms; 50: 1125 ms, all with connections
+      # released after only 250 ms -- shows queuing waits that already reach into the same range a stuck
+      # connection would. No measurement taken here can separate the two for a deployment whose own
+      # concurrency was never measured -- only that deployment can. On 2026-08-01 the owner decided a
+      # conservative shipped default was still better than none: 30000 ms is roughly 3x the ~10 s an
+      # extended operation can hold a connection at this tenant's size, enough headroom for an ordinary
+      # caller to queue behind two or three such operations on a modestly busy deployment without being
+      # refused, while still being a real bound rather than "wait forever". This is a starting point
+      # calibrated on synthetic data, not this deployment's measured concurrency -- raise it if extended
+      # operations queue routinely at your scale, lower it if a stuck connection needs to surface faster
+      # than 30 s. See openppwr.env.example for the same reasoning with the full operator note.
+      OPENPPWR_DB_INTERACTIVE_STATEMENT_TIMEOUT_MS: ${OPENPPWR_DB_INTERACTIVE_STATEMENT_TIMEOUT_MS:-}
+      OPENPPWR_DB_EXTENDED_STATEMENT_TIMEOUT_MS: ${OPENPPWR_DB_EXTENDED_STATEMENT_TIMEOUT_MS:-2000}
+      OPENPPWR_DB_CHECKOUT_TIMEOUT_MS: ${OPENPPWR_DB_CHECKOUT_TIMEOUT_MS:-30000}
+    volumes:
+      - evidence-data:/var/lib/openppwr
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    # `app` for web to reach it; `data` for the database. Not `scanner` — the API never calls ClamAV
+    # directly, only the worker does, and a request-serving container reaching the malware scanner was
+    # reachability neither needed nor intended.
+    networks: [app, data]
+    # /health/ready, not /health, on the same reasoning the worker's healthcheck below already states:
+    # readiness is the question a container healthcheck is asking. Until 2026-08-01 this service declared
+    # no healthcheck at all and inherited the image's, which probed /health — a static `{status:'ok'}`
+    # that never touched the database. So an API with an exhausted pool or a dead database reported
+    # healthy, kept receiving traffic, and additionally satisfied the `service_healthy` condition that
+    # `web` and `worker` below wait on. The image default now probes readiness too; it is restated here
+    # because a healthcheck that decides whether traffic reaches this container belongs in the file that
+    # composes the deployment, not only in the one that builds the image.
+    #
+    # This does not create a startup deadlock: `migrate` has already completed successfully, which means
+    # `postgres` was healthy and the schema is applied, so the database is up before this container
+    # starts. And `restart: unless-stopped` does not restart a container for being unhealthy, so a
+    # database outage marks the API unready — it does not put it into a restart loop.
+    healthcheck:
+      test: [CMD, /nodejs/bin/node, -e, "fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+    mem_limit: 1g
+    cpus: 1.5
+
+  worker:
+    <<: *app
+    logging:
+      driver: journald
+      options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.worker"}
+    command: [apps/worker/src/server.mjs]
+    environment:
+      # The worker's own identity. It previously shared OPENPPWR_DATABASE_URL with the API, which meant the
+      # retention state machine — moved behind functions precisely so no role could write the fence directly
+      # — was callable from the request-serving process. Separating operations in the schema achieves nothing
+      # while the deployment collapses two services into one identity.
+      OPENPPWR_DATABASE_URL: postgres://openppwr_worker:${OPENPPWR_WORKER_DATABASE_PASSWORD}@postgres/openppwr
+      OPENPPWR_WORKER_TOKEN: ${OPENPPWR_WORKER_TOKEN:?Set worker token}
+      OPENPPWR_EVIDENCE_STORAGE_ROOT: /var/lib/openppwr/evidence
+      OPENPPWR_CLAMAV_HOST: clamav
+      OPENPPWR_CLAMAV_PORT: 3310
+      # The same deadlines the API takes, on the same terms -- see the `api` service above for the full
+      # measurement this is based on. The worker runs its own pool on its own principal, so a deployment
+      # that bounds one process and not the other has bounded half of what talks to the database.
+      OPENPPWR_DB_INTERACTIVE_STATEMENT_TIMEOUT_MS: ${OPENPPWR_DB_INTERACTIVE_STATEMENT_TIMEOUT_MS:-}
+      OPENPPWR_DB_EXTENDED_STATEMENT_TIMEOUT_MS: ${OPENPPWR_DB_EXTENDED_STATEMENT_TIMEOUT_MS:-2000}
+      OPENPPWR_DB_CHECKOUT_TIMEOUT_MS: ${OPENPPWR_DB_CHECKOUT_TIMEOUT_MS:-30000}
+    volumes:
+      - evidence-data:/var/lib/openppwr
+    depends_on:
+      api: {condition: service_healthy}
+      clamav: {condition: service_healthy}
+    # `data` for the database; `scanner` to reach ClamAV. Not `app` or `edge` — nothing calls the worker
+    # over HTTP from another container, and it was reachable from web and api on the flat network before
+    # for no reason either needed.
+    networks: [data, scanner]
+    # /health/ready, not /health: readiness is the question a container healthcheck is asking — can this
+    # worker do its job right now — and it is the one the answer should be keyed to.
+    #
+    # The distinction is not cosmetic. Until 2026-07-30 the worker reported healthy again after any empty
+    # poll, so a dead scanner looked exactly like an idle queue. /health/ready now stays 503 while
+    # an infrastructure fault is outstanding and returns to 200 only on evidence — a completed scan or a
+    # successful scanner probe. /health remains available and returns the full operational snapshot,
+    # including the degraded state, which a healthcheck reduced to a boolean cannot express.
+    healthcheck:
+      test: [CMD, /nodejs/bin/node, -e, "fetch('http://127.0.0.1:3000/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+    mem_limit: 1g
+    cpus: 1.5
+
+  web:
+    <<: *app
+    logging:
+      driver: journald
+      options: {tag: "${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}.web"}
+    command: [apps/web/server.mjs]
+    environment:
+      OPENPPWR_WEB_HOST: 0.0.0.0
+      OPENPPWR_WEB_PORT: 8080
+      OPENPPWR_API_ORIGIN: http://api:3000
+      # Which hostname is which surface. Absent by default, which keeps single-domain self-hosting
+      # working; once set, an undeclared host is refused rather than served the marketing site.
+      OPENPPWR_HOST_MAP: ${OPENPPWR_HOST_MAP:-}
+      OPENPPWR_IMAGE_DIGEST: ${OPENPPWR_IMAGE_DIGEST:-}
+      # `--env-file` only supplies values for this file's own `${...}` interpolation; it does not inject
+      # arbitrary variables into a container, so an operator setting either flag in `openppwr.env` had no
+      # effect at all until it was also named here — the documented Cloudflare topology
+      # requiring the X-Forwarded-Host opt-in (see openppwr.env.example for when to set it)
+      # could not actually be enabled through this shipped stack. Both default unset, which is the same
+      # untrusted-by-default posture the application code already enforces on its own.
+      OPENPPWR_TRUST_X_FORWARDED_HOST: ${OPENPPWR_TRUST_X_FORWARDED_HOST:-}
+      OPENPPWR_TRUST_CF_CONNECTING_IP: ${OPENPPWR_TRUST_CF_CONNECTING_IP:-}
+    depends_on:
+      api: {condition: service_healthy}
+    # `edge` for the published port; `app` to reach the API. Not `data` or `scanner` — the one
+    # internet-facing container had a direct path to the database and the malware scanner on the old flat
+    # `private` network, neither ever used nor intended.
+    networks: [app, edge]
+    ports:
+      - ${OPENPPWR_BIND_ADDRESS:-127.0.0.1}:${OPENPPWR_WEB_PORT:-31114}:8080
+    healthcheck:
+      test: [CMD, /nodejs/bin/node, -e, "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+    mem_limit: 512m
+    cpus: 1
+
+networks:
+  # web <-> api. Neither the database nor the scanner is reachable from here.
+  app:
+    internal: true
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-app
+  # api, worker, migrate <-> postgres. Web is not a member and cannot reach the database directly
+  # by design: the flat `private` network this replaces put every service, including the one
+  # internet-facing container, on the same segment as the database and the scanner for no reason either
+  # ever used.
+  data:
+    internal: true
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-data
+  # worker <-> clamav. Neither the API nor web is a member; only the worker ever sends untrusted evidence
+  # bytes to the scanner.
+  scanner:
+    internal: true
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-scanner
+  edge:
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-edge
+  scanner-egress:
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-scanner-egress
+
+volumes:
+  postgres-data:
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-postgres
+  evidence-data:
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-evidence
+  clamav-data:
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-clamav

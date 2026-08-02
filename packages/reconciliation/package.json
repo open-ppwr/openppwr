@@ -1,0 +1,1 @@
+{"name":"@openppwr/reconciliation","version":"1.0.0","private":true,"license":"Apache-2.0","type":"module","exports":"./src/index.mjs","scripts":{"lint":"node --check src/index.mjs","typecheck":"node --check src/index.mjs","test":"node --test test/index.test.mjs","test:unit":"node --test test/index.test.mjs","build":"node --check src/index.mjs"}}

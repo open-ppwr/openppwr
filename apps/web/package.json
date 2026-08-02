@@ -1,0 +1,24 @@
+{
+  "name": "@openppwr/web",
+  "version": "1.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "start": "node server.mjs",
+    "test:unit": "node --test test/*.test.mjs",
+    "build": "node --check server.mjs && node ../../scripts/acme/acme-dataset.mjs export --out public/downloads && vite build",
+    "lint": "node --check server.mjs && vite build --emptyOutDir=false --logLevel error",
+    "typecheck": "node --check server.mjs && vite build --emptyOutDir=false --logLevel error"
+  },
+  "dependencies": {
+    "@openppwr/security": "1.0.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "vite": "^7.3.6"
+  }
+}

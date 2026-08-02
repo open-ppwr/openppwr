@@ -1,0 +1,600 @@
+name: Prepare Community image
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after explicit owner approval and protected-environment review
+        required: true
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: community-image-1.0.0
+  cancel-in-progress: false
+env:
+  # The image tag is the bare SemVer, because scripts/release/validate-release-ref.mjs treats
+  # ghcr.io/open-ppwr/openppwr:<package.json version> as the one accepted release reference. The Git tag
+  # carries the "v" prefix so it falls under the planned refs/tags/v* ruleset. Both are stated explicitly
+  # here rather than derived, so a mismatch is visible in review instead of at publication time.
+  OPENPPWR_VERSION: 1.0.0
+  OPENPPWR_RELEASE_TAG: v1.0.0
+  OPENPPWR_IMAGE: ghcr.io/open-ppwr/openppwr:1.0.0
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Verify publication prerequisites
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          REGISTRY_MODE: ${{ vars.PUBLICATION_REGISTRY_MODE }}
+          GHCR_IMAGE: ${{ vars.GHCR_IMAGE }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          # Presence only. The expression yields the string "true" or "false"; the token itself is never
+          # placed in an environment variable, an output, a log line or a file.
+          DOCKERHUB_TOKEN_PRESENT: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          failures=0
+          fail() { echo "PRECONDITION_FAIL $1" >&2; failures=$((failures + 1)); }
+
+          [[ "$REGISTRY_MODE" == "GHCR_PRIMARY_DOCKERHUB_MIRROR" ]] \
+            || fail "PUBLICATION_REGISTRY_MODE must be GHCR_PRIMARY_DOCKERHUB_MIRROR; received '${REGISTRY_MODE:-<unset>}'"
+          [[ "$GHCR_IMAGE" == "ghcr.io/open-ppwr/openppwr" ]] \
+            || fail "GHCR_IMAGE must be ghcr.io/open-ppwr/openppwr; received '${GHCR_IMAGE:-<unset>}'"
+          [[ "$DOCKERHUB_IMAGE" == "openppwr/openppwr" ]] \
+            || fail "DOCKERHUB_IMAGE must be openppwr/openppwr; received '${DOCKERHUB_IMAGE:-<unset>}'"
+          [[ -n "${DOCKERHUB_USERNAME:-}" ]] \
+            || fail "DOCKERHUB_USERNAME must not be empty"
+          [[ "$DOCKERHUB_TOKEN_PRESENT" == "true" ]] \
+            || fail "DOCKERHUB_TOKEN secret is not available to this job"
+          [[ "$OPENPPWR_IMAGE" == "${GHCR_IMAGE}:${OPENPPWR_VERSION}" ]] \
+            || fail "OPENPPWR_IMAGE must be \${GHCR_IMAGE}:\${OPENPPWR_VERSION}"
+          [[ "$OPENPPWR_RELEASE_TAG" == "v${OPENPPWR_VERSION}" ]] \
+            || fail "OPENPPWR_RELEASE_TAG must be v\${OPENPPWR_VERSION}"
+
+          # A moving tag can never be the published reference, whichever way it is spelled.
+          for forbidden in latest edge nightly stable main master; do
+            [[ "$OPENPPWR_VERSION" != "$forbidden" ]] \
+              || fail "version must be an immutable release identifier, not '$forbidden'"
+          done
+
+          if [[ "$PUBLISH_REQUESTED" == "true" && "$SOURCE_REF" != "refs/tags/${OPENPPWR_RELEASE_TAG}" ]]; then
+            fail "publishing requires refs/tags/${OPENPPWR_RELEASE_TAG}; received '${SOURCE_REF}'"
+          fi
+
+          if (( failures > 0 )); then
+            echo "PRECONDITIONS_FAILED count=${failures}" >&2
+            exit 1
+          fi
+          echo "PRECONDITIONS_PASS publish=${PUBLISH_REQUESTED} mode=${REGISTRY_MODE} release_tag=${OPENPPWR_RELEASE_TAG}"
+  build-scan-publish-ghcr:
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    environment: public-release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      ghcr_digest: ${{ steps.publish.outputs.digest }}
+      build_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Validate release metadata and immutable tag
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          npm ci --ignore-scripts
+          npm run release:image:validate
+          node scripts/release/validate-release-ref.mjs "$OPENPPWR_IMAGE"
+          if [[ "$PUBLISH_REQUESTED" == "true" && "$SOURCE_REF" != "refs/tags/${OPENPPWR_RELEASE_TAG}" ]]; then
+            echo "Publishing requires refs/tags/${OPENPPWR_RELEASE_TAG}" >&2
+            exit 1
+          fi
+      - name: Prepare evidence directory
+        run: mkdir -p artifacts/supply-chain
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: inputs.publish
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/open-ppwr/openppwr
+          tags: type=raw,value=1.0.0
+          # Pinned here rather than left to be derived, because `labels:` on the build step below
+          # overrides every LABEL in the Dockerfile. Left to itself, metadata-action fills these from
+          # the GitHub repository's own title, description and licence fields -- so the published
+          # image would carry `openppwr` as its title and empty description and licence until
+          # somebody happened to fill in the repository settings, and would silently change meaning
+          # if anyone later edited them. The image describes the software, not the repository page.
+          labels: |
+            org.opencontainers.image.title=OpenPPWR
+            org.opencontainers.image.description=Open-source packaging compliance platform for Europe
+            org.opencontainers.image.licenses=Apache-2.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        with:
+          context: .
+          push: false
+          load: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # All five arguments the Dockerfile declares, because passing a subset does not fail the build --
+          # it silently ships the defaults. The published 1.0.0 image answered /v1/version with
+          # channel=private-release-candidate, builtAt=unknown and migrationLevel=unknown, so the released
+          # artefact told every user it was a private candidate that could not verify its own schema. The
+          # OCI `created` label was right at the same time, because metadata-action overwrites it -- the same
+          # image answered "when were you built" two different ways and the label check passed.
+          build-args: |
+            OPENPPWR_VERSION=1.0.0
+            OPENPPWR_REVISION=${{ github.sha }}
+            OPENPPWR_BUILD_TIMESTAMP=${{ steps.meta.outputs.created || github.event.repository.updated_at }}
+            OPENPPWR_RELEASE_CHANNEL=community
+            OPENPPWR_MIGRATION_LEVEL=039
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+      - name: Scan image vulnerabilities
+        uses: anchore/scan-action@3c9a191a0fbab285ca6b8530b5de5a642cba332f # v7.2.2
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          fail-build: true
+          severity-cutoff: high
+          output-format: json
+          output-file: artifacts/supply-chain/grype-image.json
+          grype-version: v0.112.0
+      - name: Scan Dockerfile and build configuration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          scanners: misconfig
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: json
+          output: artifacts/supply-chain/trivy-config.json
+          version: v0.70.0
+      - name: Generate SPDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          format: spdx-json
+          output-file: artifacts/supply-chain/openppwr-1.0.0.spdx.json
+          artifact-name: openppwr-1.0.0.spdx.json
+          syft-version: v1.44.0
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Generate CycloneDX JSON SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.meta.outputs.tags }}
+          format: cyclonedx-json
+          output-file: artifacts/supply-chain/openppwr-1.0.0.cyclonedx.json
+          artifact-name: openppwr-1.0.0.cyclonedx.json
+          syft-version: v1.44.0
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Publish exact scanned image
+        id: publish
+        if: inputs.publish
+        run: |
+          set +e
+          existing=$(docker buildx imagetools inspect "$OPENPPWR_IMAGE" 2>&1)
+          inspect_status=$?
+          set -e
+          if [[ $inspect_status -eq 0 ]]; then
+            echo "Refusing to overwrite existing immutable release tag: $OPENPPWR_IMAGE" >&2
+            exit 1
+          fi
+          if ! grep -Eqi 'not found|manifest unknown' <<<"$existing"; then
+            echo "Unable to prove the release tag is unused; refusing publication." >&2
+            printf '%s\n' "$existing" >&2
+            exit 1
+          fi
+          docker push "$OPENPPWR_IMAGE" | tee artifacts/supply-chain/push-result.txt
+          digest=$(sed -n 's/^.*digest: \(sha256:[a-f0-9]\{64\}\).*$/\1/p' artifacts/supply-chain/push-result.txt | tail -1)
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "Published digest missing from docker push output" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest published build provenance
+        id: provenance
+        if: inputs.publish
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ghcr.io/open-ppwr/openppwr
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+      - name: Attest published SPDX SBOM
+        id: sbom-attestation
+        if: inputs.publish
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-name: ghcr.io/open-ppwr/openppwr
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: artifacts/supply-chain/openppwr-1.0.0.spdx.json
+          push-to-registry: true
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: inputs.publish
+        with:
+          cosign-release: v3.0.6
+      - name: Sign published digest with GitHub OIDC
+        if: inputs.publish
+        run: cosign sign --yes ghcr.io/open-ppwr/openppwr@${{ steps.publish.outputs.digest }}
+      - name: Verify published signature identity
+        if: inputs.publish
+        run: |
+          cosign verify \
+            --certificate-identity "https://github.com/open-ppwr/openppwr/.github/workflows/release-image.yml@${{ github.ref }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "ghcr.io/open-ppwr/openppwr@${{ steps.publish.outputs.digest }}" \
+            | tee artifacts/supply-chain/cosign-verify.txt
+      - name: Record candidate digest and checksums
+        if: always()
+        env:
+          OPENPPWR_BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          OPENPPWR_PUBLISHED_DIGEST: ${{ steps.publish.outputs.digest }}
+          OPENPPWR_PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          OPENPPWR_PROVENANCE_URL: ${{ steps.provenance.outputs.attestation-url }}
+          OPENPPWR_SBOM_ATTESTATION_BUNDLE: ${{ steps.sbom-attestation.outputs.bundle-path }}
+          OPENPPWR_SBOM_ATTESTATION_URL: ${{ steps.sbom-attestation.outputs.attestation-url }}
+        run: |
+          if [[ -n "$OPENPPWR_PROVENANCE_BUNDLE" && -f "$OPENPPWR_PROVENANCE_BUNDLE" ]]; then cp "$OPENPPWR_PROVENANCE_BUNDLE" artifacts/supply-chain/provenance.sigstore.json; fi
+          if [[ -n "$OPENPPWR_SBOM_ATTESTATION_BUNDLE" && -f "$OPENPPWR_SBOM_ATTESTATION_BUNDLE" ]]; then cp "$OPENPPWR_SBOM_ATTESTATION_BUNDLE" artifacts/supply-chain/sbom-attestation.sigstore.json; fi
+          printf '%s\n' "source_revision=${{ github.sha }}" "image=$OPENPPWR_IMAGE" "release_tag=$OPENPPWR_RELEASE_TAG" "build_digest=$OPENPPWR_BUILD_DIGEST" "published_digest=$OPENPPWR_PUBLISHED_DIGEST" "published=${{ inputs.publish }}" "single_build=PASS" "provenance_attestation_url=$OPENPPWR_PROVENANCE_URL" "sbom_attestation_url=$OPENPPWR_SBOM_ATTESTATION_URL" > artifacts/supply-chain/build-evidence.txt
+          find artifacts/supply-chain -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > artifacts/supply-chain/SHA256SUMS
+      - name: Upload GHCR supply-chain evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openppwr-1.0.0-supply-chain
+          path: artifacts/supply-chain
+          if-no-files-found: error
+          retention-days: 30
+  mirror-dockerhub:
+    # Docker Hub receives a copy of the manifest that GHCR already holds. It never builds, and it is
+    # reached only through `needs`, so no path exists to a Docker Hub image that GHCR did not publish first.
+    needs:
+      - validate-inputs
+      - build-scan-publish-ghcr
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      dockerhub_digest: ${{ steps.mirror.outputs.dockerhub_digest }}
+      digest_parity: ${{ steps.mirror.outputs.digest_parity }}
+      platform_parity: ${{ steps.platforms.outputs.platform_parity }}
+      runtime_platforms: ${{ steps.platforms.outputs.runtime_platforms }}
+      attestation_manifests: ${{ steps.platforms.outputs.attestation_manifests }}
+    env:
+      GHCR_IMAGE: ${{ vars.GHCR_IMAGE }}
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+      GHCR_DIGEST: ${{ needs.build-scan-publish-ghcr.outputs.ghcr_digest }}
+    steps:
+      # The mirror job reads three helper subcommands out of `scripts/release/verify-registry-mirror.sh`,
+      # and had no checkout, so that path did not exist on the runner. The job authenticated to both
+      # registries and then died with exit 127 at the first helper call -- after logging in to Docker Hub,
+      # which is the worst place to discover a missing file. Fifteen assertions in validate-supply-chain
+      # cover this job and none of them asked whether it can reach the files it runs.
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+      - name: Validate mirror inputs
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/mirror
+          if [[ ! "$GHCR_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "MIRROR_FAIL canonical GHCR digest is missing or malformed" >&2
+            exit 1
+          fi
+          if [[ -z "${GHCR_IMAGE:-}" || -z "${DOCKERHUB_IMAGE:-}" ]]; then
+            echo "MIRROR_FAIL registry variables are not available to the mirror job" >&2
+            exit 1
+          fi
+          # The mirror publishes exactly one immutable version tag. A moving tag is never created here.
+          for forbidden in latest edge nightly stable; do
+            if [[ "$OPENPPWR_VERSION" == "$forbidden" ]]; then
+              echo "MIRROR_FAIL refusing to mirror a moving tag: $forbidden" >&2
+              exit 1
+            fi
+          done
+          echo "MIRROR_INPUTS_PASS source=${GHCR_IMAGE}@${GHCR_DIGEST} target=docker.io/${DOCKERHUB_IMAGE}:${OPENPPWR_VERSION}"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Authenticate to GHCR for read access
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Authenticate to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Read the canonical GHCR manifest
+        run: |
+          set -Eeuo pipefail
+          source_ref="${GHCR_IMAGE}@${GHCR_DIGEST}"
+          docker buildx imagetools inspect "$source_ref" --raw > artifacts/mirror/ghcr-manifest.json
+          docker buildx imagetools inspect "$source_ref" --format '{{json .Manifest}}' > artifacts/mirror/ghcr-descriptor.json
+          docker buildx imagetools inspect "$source_ref" --format '{{json .Image}}' > artifacts/mirror/ghcr-image-config.json
+
+          source_media_type="$(scripts/release/verify-registry-mirror.sh media-type artifacts/mirror/ghcr-manifest.json)"
+          source_digest="$(scripts/release/verify-registry-mirror.sh digest artifacts/mirror/ghcr-descriptor.json)"
+          if [[ "$source_digest" != "$GHCR_DIGEST" ]]; then
+            echo "MIRROR_FAIL source digest drifted from the digest the publish step emitted" >&2
+            echo "  published: $GHCR_DIGEST" >&2
+            echo "  inspected: $source_digest" >&2
+            exit 1
+          fi
+
+          scripts/release/verify-registry-mirror.sh platforms \
+            artifacts/mirror/ghcr-manifest.json \
+            artifacts/mirror/ghcr-image-config.json > artifacts/mirror/platforms-ghcr.txt
+          ghcr_attestations="$(scripts/release/verify-registry-mirror.sh attestation-count artifacts/mirror/ghcr-manifest.json)"
+
+          {
+            echo "SOURCE_MEDIA_TYPE=$source_media_type"
+            echo "GHCR_ATTESTATIONS=$ghcr_attestations"
+          } >> "$GITHUB_ENV"
+          echo "MIRROR_SOURCE_PASS media_type=$source_media_type digest=$source_digest"
+      - name: Classify the destination tag
+        id: probe
+        run: |
+          set -Eeuo pipefail
+          target="docker.io/${DOCKERHUB_IMAGE}:${OPENPPWR_VERSION}"
+          set +e
+          docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' \
+            > artifacts/mirror/probe-stdout.json 2> artifacts/mirror/probe-stderr.txt
+          probe_status=$?
+          set -e
+
+          # A non-zero exit code proves nothing on its own: an expired token, a rate limit and a 502
+          # all produce one, and reading any of them as "the tag is free" is how a mirror overwrites
+          # an image. Only a confirmed absence is NOT_FOUND.
+          classification="$(scripts/release/verify-registry-mirror.sh classify-inspect "$probe_status" artifacts/mirror/probe-stderr.txt)"
+          echo "classification=$classification" >> "$GITHUB_OUTPUT"
+          echo "MIRROR_PROBE classification=$classification"
+
+          if [[ "$classification" == "INSPECT_ERROR" ]]; then
+            echo "MIRROR_FAIL destination state could not be established; refusing to mirror." >&2
+            sed -E 's/[A-Za-z0-9_.+/=-]{40,}/<redacted>/g' artifacts/mirror/probe-stderr.txt >&2
+            exit 1
+          fi
+      - name: Copy the GHCR manifest to Docker Hub, or resume a matching copy
+        id: mirror
+        env:
+          CLASSIFICATION: ${{ steps.probe.outputs.classification }}
+        run: |
+          set -Eeuo pipefail
+          source_ref="${GHCR_IMAGE}@${GHCR_DIGEST}"
+          target="docker.io/${DOCKERHUB_IMAGE}:${OPENPPWR_VERSION}"
+
+          if [[ "$CLASSIFICATION" == "PRESENT" ]]; then
+            existing_digest="$(scripts/release/verify-registry-mirror.sh digest artifacts/mirror/probe-stdout.json)"
+            if [[ "$existing_digest" != "$GHCR_DIGEST" ]]; then
+              echo "MIRROR_FAIL existing tag collision: $target already holds a different image." >&2
+              echo "  ghcr:      $GHCR_DIGEST" >&2
+              echo "  dockerhub: $existing_digest" >&2
+              echo "  The tag is immutable and is not overwritten or deleted here." >&2
+              exit 1
+            fi
+            # The copy already succeeded on an earlier attempt and a later step failed. Re-running the
+            # full validation is safe and is the point: the mirror is proven, not assumed.
+            mirror_state=ALREADY_PRESENT_MATCHING
+            echo "MIRROR_RESUME the destination already holds the canonical digest; skipping the copy"
+          else
+            # Copy, not rebuild. --prefer-index=false because the flag defaults to true and then
+            # prefers wrapping a lone manifest in a new index, which would change the digest. No
+            # --append, no --annotation and no platform filter, because each would rewrite the
+            # manifest and defeat the parity this job exists to prove.
+            touch artifacts/mirror/mirror-may-exist
+            docker buildx imagetools create \
+              --prefer-index=false \
+              --tag "$target" \
+              --metadata-file artifacts/mirror/mirror-metadata.json \
+              "$source_ref"
+            mirror_state=CREATED
+          fi
+          echo "mirror_state=$mirror_state" >> "$GITHUB_OUTPUT"
+      - name: Prove the destination is the canonical image
+        id: verify
+        run: |
+          set -Eeuo pipefail
+          target="docker.io/${DOCKERHUB_IMAGE}:${OPENPPWR_VERSION}"
+          docker buildx imagetools inspect "$target" --raw > artifacts/mirror/dockerhub-manifest.json
+          docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' > artifacts/mirror/dockerhub-descriptor.json
+          docker buildx imagetools inspect "$target" --format '{{json .Image}}' > artifacts/mirror/dockerhub-image-config.json
+
+          dest_media_type="$(scripts/release/verify-registry-mirror.sh media-type artifacts/mirror/dockerhub-manifest.json)"
+          dest_digest="$(scripts/release/verify-registry-mirror.sh digest artifacts/mirror/dockerhub-descriptor.json)"
+
+          if [[ "$dest_digest" != "$GHCR_DIGEST" ]]; then
+            echo "MIRROR_FAIL digest parity not proven; the mirror is not the canonical image." >&2
+            echo "  ghcr:       $GHCR_DIGEST" >&2
+            echo "  dockerhub:  $dest_digest" >&2
+            echo "" >&2
+            echo "  The copy ran with --prefer-index=false, so the source manifest format should have" >&2
+            echo "  been preserved. If the destination is an index while the source is not, the flag" >&2
+            echo "  did not take effect: check the buildx version on the runner. Do not relax this" >&2
+            echo "  check." >&2
+            exit 1
+          fi
+
+          if [[ "$dest_media_type" != "$SOURCE_MEDIA_TYPE" ]]; then
+            echo "MIRROR_FAIL media type changed during the copy" >&2
+            echo "  ghcr:       $SOURCE_MEDIA_TYPE" >&2
+            echo "  dockerhub:  $dest_media_type" >&2
+            exit 1
+          fi
+
+          scripts/release/verify-registry-mirror.sh platforms \
+            artifacts/mirror/dockerhub-manifest.json \
+            artifacts/mirror/dockerhub-image-config.json > artifacts/mirror/platforms-dockerhub.txt
+          scripts/release/verify-registry-mirror.sh compare-platforms \
+            artifacts/mirror/platforms-ghcr.txt \
+            artifacts/mirror/platforms-dockerhub.txt
+
+          dest_attestations="$(scripts/release/verify-registry-mirror.sh attestation-count artifacts/mirror/dockerhub-manifest.json)"
+          ghcr_count="$(grep -cve '^[[:space:]]*$' artifacts/mirror/platforms-ghcr.txt)"
+          dest_count="$(grep -cve '^[[:space:]]*$' artifacts/mirror/platforms-dockerhub.txt)"
+          platforms_csv="$(paste -sd, artifacts/mirror/platforms-ghcr.txt)"
+
+          {
+            echo "dockerhub_digest=$dest_digest"
+            echo "destination_media_type=$dest_media_type"
+            echo "digest_parity=PASS"
+            echo "platform_parity=PASS"
+            echo "runtime_platforms=$platforms_csv"
+            echo "ghcr_platform_count=$ghcr_count"
+            echo "dockerhub_platform_count=$dest_count"
+            echo "attestation_manifests=ghcr:${GHCR_ATTESTATIONS} dockerhub:${dest_attestations}"
+          } >> "$GITHUB_OUTPUT"
+          echo "MIRROR_PARITY_PASS digest=$dest_digest platforms=$platforms_csv"
+      - name: Record mirror evidence
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' \
+            "source_commit=${{ github.sha }}" \
+            "version=${OPENPPWR_VERSION}" \
+            "release_tag=${OPENPPWR_RELEASE_TAG}" \
+            "ghcr_image=${GHCR_IMAGE}" \
+            "ghcr_digest=${GHCR_DIGEST}" \
+            "dockerhub_image=${DOCKERHUB_IMAGE}" \
+            "dockerhub_digest=${{ steps.verify.outputs.dockerhub_digest }}" \
+            "mirror_state=${{ steps.mirror.outputs.mirror_state }}" \
+            "source_media_type=${SOURCE_MEDIA_TYPE}" \
+            "destination_media_type=${{ steps.verify.outputs.destination_media_type }}" \
+            "ghcr_platform_count=${{ steps.verify.outputs.ghcr_platform_count }}" \
+            "dockerhub_platform_count=${{ steps.verify.outputs.dockerhub_platform_count }}" \
+            "digest_parity=${{ steps.verify.outputs.digest_parity }}" \
+            "platform_parity=${{ steps.verify.outputs.platform_parity }}" \
+            "runtime_platforms=${{ steps.verify.outputs.runtime_platforms }}" \
+            "attestation_manifests=${{ steps.verify.outputs.attestation_manifests }}" \
+            "single_build=PASS" \
+            "dockerhub_rebuild=NO" \
+            "moving_tag_published=NO" \
+            > artifacts/mirror/mirror-evidence.txt
+          rm -f artifacts/mirror/mirror-may-exist
+          find artifacts/mirror -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > artifacts/mirror/SHA256SUMS
+          cat artifacts/mirror/mirror-evidence.txt
+      - name: Upload mirror evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openppwr-1.0.0-dockerhub-mirror
+          path: artifacts/mirror
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record mirror failure state
+        if: failure()
+        run: |
+          set +e
+          mkdir -p artifacts/mirror-failure
+          may_exist=false
+          [[ -f artifacts/mirror/mirror-may-exist ]] && may_exist=true
+          printf '%s\n' \
+            "source_commit=${{ github.sha }}" \
+            "version=${OPENPPWR_VERSION}" \
+            "ghcr_digest=${GHCR_DIGEST}" \
+            "probe_classification=${{ steps.probe.outputs.classification }}" \
+            "mirror_state=${{ steps.mirror.outputs.mirror_state }}" \
+            "mirror_may_exist=${may_exist}" \
+            "digest_parity=NOT_PROVEN" \
+            "platform_parity=NOT_PROVEN" \
+            "next_run=re-run this workflow; an existing destination tag whose digest matches the canonical digest is resumed and re-validated rather than overwritten" \
+            > artifacts/mirror-failure/mirror-failure.txt
+          # Registry errors can echo request URLs carrying credentials; long opaque tokens are removed.
+          for source in artifacts/mirror/probe-stderr.txt; do
+            [[ -f "$source" ]] && sed -E 's/[A-Za-z0-9_.+/=-]{40,}/<redacted>/g' "$source" > "artifacts/mirror-failure/$(basename "$source")"
+          done
+          cat artifacts/mirror-failure/mirror-failure.txt
+      - name: Upload mirror failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openppwr-1.0.0-dockerhub-mirror-failure
+          path: artifacts/mirror-failure
+          if-no-files-found: warn
+          retention-days: 30
+  release-evidence:
+    # Runs only when both registries agree. A release summary is a claim about what was published, so it
+    # is produced from the jobs that published, and only after each of them proved its own outcome.
+    needs:
+      - build-scan-publish-ghcr
+      - mirror-dockerhub
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Assemble release evidence
+        env:
+          GHCR_IMAGE: ${{ vars.GHCR_IMAGE }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          GHCR_DIGEST: ${{ needs.build-scan-publish-ghcr.outputs.ghcr_digest }}
+          DOCKERHUB_DIGEST: ${{ needs.mirror-dockerhub.outputs.dockerhub_digest }}
+          DIGEST_PARITY: ${{ needs.mirror-dockerhub.outputs.digest_parity }}
+          PLATFORM_PARITY: ${{ needs.mirror-dockerhub.outputs.platform_parity }}
+          RUNTIME_PLATFORMS: ${{ needs.mirror-dockerhub.outputs.runtime_platforms }}
+          ATTESTATION_MANIFESTS: ${{ needs.mirror-dockerhub.outputs.attestation_manifests }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/release
+          if [[ "$DIGEST_PARITY" != "PASS" || "$PLATFORM_PARITY" != "PASS" ]]; then
+            echo "RELEASE_EVIDENCE_FAIL parity was not proven; refusing to record a successful release" >&2
+            exit 1
+          fi
+          if [[ "$GHCR_DIGEST" != "$DOCKERHUB_DIGEST" ]]; then
+            echo "RELEASE_EVIDENCE_FAIL digests disagree across registries" >&2
+            exit 1
+          fi
+          printf '%s\n' \
+            "source_commit=${{ github.sha }}" \
+            "version=${OPENPPWR_VERSION}" \
+            "release_tag=${OPENPPWR_RELEASE_TAG}" \
+            "ghcr_image=${GHCR_IMAGE}" \
+            "ghcr_digest=${GHCR_DIGEST}" \
+            "dockerhub_image=${DOCKERHUB_IMAGE}" \
+            "dockerhub_digest=${DOCKERHUB_DIGEST}" \
+            "digest_parity=${DIGEST_PARITY}" \
+            "platform_parity=${PLATFORM_PARITY}" \
+            "runtime_platforms=${RUNTIME_PLATFORMS}" \
+            "attestation_manifests=${ATTESTATION_MANIFESTS}" \
+            "single_build=PASS" \
+            "dockerhub_rebuild=NO" \
+            "moving_tag_published=NO" \
+            "canonical_registry=ghcr" \
+            "signatures_and_attestations=ghcr-only" \
+            > artifacts/release/release-evidence.txt
+          find artifacts/release -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > artifacts/release/SHA256SUMS
+          cat artifacts/release/release-evidence.txt
+      - name: Upload release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openppwr-1.0.0-release-evidence
+          path: artifacts/release
+          if-no-files-found: error
+          retention-days: 30

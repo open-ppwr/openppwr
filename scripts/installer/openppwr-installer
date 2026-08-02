@@ -1,0 +1,1481 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+
+PROGRAM=openppwr-installer
+ROOT=${OPENPPWR_INSTALL_ROOT:-/opt/openppwr}
+COMPOSE_FILE="$ROOT/docker-compose.yml"
+ENV_FILE="$ROOT/secrets/openppwr.env"
+STATE_DIR="$ROOT/state"
+BACKUP_DIR="$ROOT/backups"
+# Public half of the backup key pair. Deliberately the only half this host ever holds: see backup_key().
+BACKUP_RECIPIENT="$ROOT/secrets/backup-recipient.pem"
+SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+
+fail(){ printf '%s: %s\n' "$PROGRAM" "$1" >&2; exit "${2:-1}"; }
+need_root(){ [ "$(id -u)" -eq 0 ] || fail 'root or sudo is required' 10; }
+need(){ command -v "$1" >/dev/null 2>&1 || fail "$1 is required" 11; }
+compose(){ docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"; }
+# Rejecting `:latest` is not enough: a bare reference with no tag or digest at all (`openppwr`) resolves to
+# `:latest` implicitly, passing the old check by omission rather than by name. Checked against
+# the segment after the final `/` only, not the whole reference, so a registry host's own `:port` (e.g.
+# `registry.example.com:5000/openppwr`) is never mistaken for a tag. A `@sha256:` digest is additionally
+# required to be exactly 64 lowercase hex characters — a truncated or malformed digest is not the immutable
+# pin the deployment docs describe. A mutable tag (`openppwr:1.0.0`) is still accepted: the images
+# have never been published to a registry (standing project rule), so a plain local build tag is the only
+# reference a real deployment can use today. This does not verify the tag stays pointed at one image —
+# only a digest does that — and the deployment docs must say so rather than calling a tag immutable.
+validate_image(){
+  case "$1" in ''|*:latest) fail 'an exact non-latest image reference is required' 12;; esac
+  # `grep -E '^...$'` anchors to each *line* of its input, not the whole string, so a value containing an
+  # embedded newline — "good\nbad" — passed whenever any one line matched, regardless of the rest (targeted
+  # rereview). No valid image reference ever contains a newline, so this is checked once, up front, for
+  # every branch below rather than only the one the original finding named.
+  newline='
+'
+  cr=$(printf '\r')
+  case "$1" in *"$newline"*) fail 'an image reference must not contain a newline' 12 ;; esac
+  case "$1" in *"$cr"*) fail 'an image reference must not contain a carriage return' 12 ;; esac
+  last_segment=${1##*/}
+  case "$last_segment" in
+    *@sha256:*)
+      # The digest suffix was the only part checked here — the portion before `@sha256:` (the name, or
+      # name:tag) was accepted verbatim, so `repo::garbage@sha256:<valid digest>` passed even though it
+      # carries the same double-colon defect the tag branch below rejects. Re-apply the
+      # identical single-colon-and-tag-grammar check to that portion when it contains a colon at all.
+      before_digest=${last_segment%%@sha256:*}
+      digest=${last_segment#*@sha256:}
+      printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' || fail 'the digest after @sha256: must be exactly 64 lowercase hex characters' 12
+      case "$before_digest" in
+        *:*)
+          before_rest=${before_digest#*:}
+          case "$before_rest" in *:*) fail 'an image reference must have exactly one tag delimiter before an @sha256 digest' 12 ;; esac
+          printf '%s' "$before_rest" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$' || fail 'an image tag before an @sha256 digest must be a valid Docker tag (alphanumeric, ., _ or -, up to 128 characters)' 12
+          ;;
+      esac
+      ;;
+    *:*)
+      # A colon being present was the whole check — `openppwr:`, `openppwr:tag@garbage` and a tag carrying
+      # embedded whitespace all passed. Docker itself would refuse these when the reference
+      # is actually used, which is why this was Low rather than an active bypass, but the validator's own
+      # claim to check the tag was false. Validated against Docker's own tag grammar: one to 128 characters,
+      # starting with an alphanumeric or underscore, then alphanumerics, `.`, `_` or `-`.
+      #
+      # `${last_segment##*:}` takes only the text after the *last* colon, so a second, earlier colon —
+      # `repo::good` — was invisible to it: the extracted "tag" (`good`) was valid even though the full
+      # reference was not. Rejected here by requiring exactly one colon in this segment.
+      rest=${last_segment#*:}
+      case "$rest" in *:*) fail 'an image reference must have exactly one tag delimiter' 12 ;; esac
+      tag=$rest
+      printf '%s' "$tag" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$' || fail 'an image tag must be a valid Docker tag (alphanumeric, ., _ or -, up to 128 characters)' 12
+      ;;
+    *) fail 'an image reference must pin an explicit tag or @sha256 digest; a bare name resolves to :latest implicitly' 12 ;;
+  esac
+}
+secret(){ openssl rand -hex 32; }
+
+# Backup encryption. The backup set leaves this host by a path the product does not control — an
+# external process copies `backups/` to another server — so its confidentiality has to travel with the bytes
+# rather than depend on the 0700 directory they were written into. The environment file inside the set holds
+# the database, worker and bootstrap credentials, which is why "root-owned 0700" was never the whole answer.
+#
+# Public-key, not passphrase. `backup` encrypts to a certificate this host holds; only the matching private
+# key can read the result, and that key is never written under $ROOT (backup_key refuses to). A host
+# compromise therefore yields the ability to write future backups and nothing else: every archive already
+# taken, and every off-host copy of it, stays unreadable. A symmetric key or a passphrase file kept in
+# `secrets/` would have been simpler and would have protected the off-host copies too, but it fails the
+# harder case — an attacker on the host reads the key and every backup it ever protected. A passphrase held
+# only by the operator fails the other way: nobody types it into a disaster-recovery runbook at 3am reliably,
+# and an unrecoverable backup is worse than an unencrypted one.
+#
+# CMS AuthEnvelopedData (RFC 5083), AES-256-GCM content encryption, RSA-OAEP-SHA256 key transport. GCM
+# rather than CBC because SHA256SUMS lives in the same directory as the archive it describes: anyone who can
+# rewrite the ciphertext can rewrite the manifest, so integrity has to be bound to the key, not to a hash
+# sitting beside the data. Tampering therefore fails decryption instead of restoring silently. `-recip` must
+# precede `-keyopt`: the key options attach to the recipient named before them, and with none named openssl
+# exits with "No key specified" rather than falling back to a default padding.
+cms_encrypt(){
+  openssl cms -encrypt -binary -stream -aes-256-gcm \
+    -recip "$3" -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256 \
+    -outform DER -in "$1" -out "$2"
+}
+
+# `-passin` is always supplied, even with no passphrase configured. Without it openssl prompts on the
+# terminal for an encrypted key, and an installer command that blocks forever on an invisible prompt is a
+# worse failure than a refusal. An empty `pass:` is ignored for an unencrypted key and fails immediately,
+# with "empty password", for an encrypted one.
+cms_decrypt(){
+  if [ -n "${4:-}" ]; then
+    openssl cms -decrypt -binary -inform DER -in "$1" -out "$2" -inkey "$3" -passin "file:$4"
+  else
+    openssl cms -decrypt -binary -inform DER -in "$1" -out "$2" -inkey "$3" -passin pass:
+  fi
+}
+
+# Identifies the key pair, not the certificate. `backup-key init` run against an already-held private key —
+# what a rebuilt host does — mints a fresh certificate over the same key, and a certificate fingerprint
+# would therefore change while the thing that actually opens the archives did not. Decryption depends on the
+# private key alone, so this is the value an operator can match a backup against.
+recipient_fingerprint(){ openssl x509 -in "$1" -noout -pubkey | sha256sum | cut -d' ' -f1; }
+
+# The plaintext member never outlives the ciphertext beside it. On failure the partial ciphertext goes too,
+# so a half-written archive is never left looking like a complete one.
+encrypt_backup_member(){
+  directory="$1"; member="$2"
+  [ -f "$directory/$member" ] || return 0
+  if ! cms_encrypt "$directory/$member" "$directory/$member.enc" "$BACKUP_RECIPIENT"; then
+    rm -f "$directory/$member.enc"
+    return 1
+  fi
+  chmod 0600 "$directory/$member.enc"
+  rm -f "$directory/$member"
+}
+
+preflight(){
+  need_root
+  [ "$(uname -m)" = x86_64 ] || fail 'only Debian 13 x86_64 is supported by this beta' 20
+  [ -r /etc/os-release ] || fail 'cannot identify operating system' 20
+  . /etc/os-release
+  [ "${ID:-}" = debian ] && [ "${VERSION_ID:-}" = 13 ] || fail 'only Debian 13 x86_64 is supported by this beta' 20
+  need docker; docker compose version >/dev/null 2>&1 || fail 'Docker Compose v2 is required' 21
+  need openssl; need sha256sum; need tar; need gzip; need curl; need realpath
+  memory_kib=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+  [ "$memory_kib" -ge 4000000 ] || fail 'at least 4 GB RAM is required' 22
+  available_kib=$(df -Pk "$(dirname "$ROOT")" 2>/dev/null | awk 'NR==2{print $4}')
+  [ -n "$available_kib" ] && [ "$available_kib" -ge 15000000 ] || fail 'at least 15 GB free disk is required' 23
+  port=${OPENPPWR_WEB_PORT:-31114}
+  if [ ! -f "$ENV_FILE" ] && command -v ss >/dev/null 2>&1 && ss -ltnH | awk '{print $4}' | grep -Eq "[:.]$port$"; then fail "loopback port $port is already in use" 24; fi
+  printf 'PREFLIGHT_PASS os=debian-13 arch=x86_64 ram_kib=%s disk_kib=%s\n' "$memory_kib" "$available_kib"
+}
+
+install_files(){
+  need_root; preflight
+  [ -f "$SOURCE_ROOT/deploy/community/docker-compose.yml" ] || fail 'run installer from an OpenPPWR release tree' 30
+  if [ -e "$COMPOSE_FILE" ] && [ "${OPENPPWR_CONFIRM_OVERWRITE:-}" != yes ]; then fail 'deployment exists; set OPENPPWR_CONFIRM_OVERWRITE=yes to refresh program files' 31; fi
+  install -d -m 0750 "$ROOT" "$ROOT/secrets" "$STATE_DIR" "$BACKUP_DIR"
+  install -m 0644 "$SOURCE_ROOT/deploy/community/docker-compose.yml" "$COMPOSE_FILE"
+  install -m 0755 "$0" /usr/local/bin/openppwr-installer
+  # Host configuration, written here rather than left as a documented manual step, because a retention
+  # period nobody applies is the state this replaced. Fatal by design when it cannot be applied safely: a
+  # deployment that silently installed without it would be back to claiming a period it does not enforce,
+  # which is the whole defect. The refusal names both ways forward.
+  if [ "${OPENPPWR_SKIP_JOURNAL_RETENTION:-}" = yes ]; then
+    printf 'INSTALL_WARN journal_retention=skipped; container logs go to the journal but no retention period is enforced\n' >&2
+  else
+    journal_retention apply
+  fi
+  printf 'INSTALL_PASS root=%s data_preserved=true\n' "$ROOT"
+}
+
+# --- Host log retention -------------------------------------------------------------------------------
+#
+# The control the compose file cannot express. Docker's json-file driver evicts by size and has no age
+# option, so what the deployment previously called retention was a volume ceiling: a quiet month was kept
+# in full and a busy day discarded the previous one. Every container now logs to journald, and journald is
+# the only component in this stack that owns an age. This drop-in is where that age lives.
+#
+# It is not a period on its own, and nothing shipped may describe it as one. journald applies a time bound
+# and a size bound together and whichever binds first wins, so what is actually promised is
+# "$OPENPPWR_JOURNAL_RETENTION or $OPENPPWR_JOURNAL_MAX_USE, whichever comes first". SystemKeepFree is
+# deliberately left at its default (15% of the filesystem) and can lower the size bound further on a
+# filling disk: journald respects both and uses the smaller of the two.
+#
+# Storage=persistent rather than Debian's default of auto, and that is not cosmetic. `auto` means
+# "persistent if /var/log/journal exists, volatile otherwise", and on Debian 13 that directory is created
+# by the systemd package's postinst only on a *new install* (the `if [ -z "$2" ]` guard around its
+# mkdir). A host upgraded into Debian 13, or built from an image that never had it, logs to /run and keeps
+# nothing across a reboot -- and a 30-day retention period on a journal that does not survive a reboot is
+# not a retention period. `persistent` creates the hierarchy if needed, so this closes that case rather
+# than depending on how the host happened to be built.
+JOURNAL_DROPIN_DIR=/etc/systemd/journald.conf.d
+JOURNAL_DROPIN="$JOURNAL_DROPIN_DIR/10-openppwr-retention.conf"
+JOURNAL_MARKER='# Written by openppwr-installer. Delete this line to take ownership of this file.'
+JOURNAL_KEYS='Storage|SystemMaxUse|SystemKeepFree|SystemMaxFileSize|MaxFileSec|MaxRetentionSec'
+
+# Separate from the writer so a validator can generate the exact shipped bytes without root, systemd or a
+# host to write them onto -- the same reason write_env_file is its own function.
+#
+# 10- rather than a high number, deliberately. Drop-ins apply in filename order and the last assignment
+# wins, so a low number means an operator's own 50- or 99- file overrides this one. That is the correct
+# default: the operator's host, the operator's decision. It is safe only because journal_verify below
+# refuses to report success when something else won, so being overridden is loud rather than silent.
+journal_retention_body(){
+  journal_retention=${OPENPPWR_JOURNAL_RETENTION:-30day}
+  journal_max_use=${OPENPPWR_JOURNAL_MAX_USE:-1G}
+  journal_max_file_size=${OPENPPWR_JOURNAL_MAX_FILE_SIZE:-128M}
+  journal_max_file_sec=${OPENPPWR_JOURNAL_MAX_FILE_SEC:-1day}
+  printf '%s\n' "$JOURNAL_MARKER"
+  printf '%s\n' '# OpenPPWR container log retention.'
+  printf '#\n'
+  printf '# This promises "%s OR %s, whichever comes first". It is not a promise of %s:\n' \
+    "$journal_retention" "$journal_max_use" "$journal_retention"
+  printf '# journald applies the age bound and the size bound together and the tighter one wins. On a busy\n'
+  printf '# deployment the size bound binds first and the journal holds less than %s.\n' "$journal_retention"
+  printf '#\n'
+  printf '# SystemKeepFree is left at its default (15%% of the filesystem) on purpose. journald uses the\n'
+  printf '# smaller of SystemMaxUse and "free space minus SystemKeepFree", so a filling disk lowers the\n'
+  printf '# effective ceiling below %s and shortens the period further.\n' "$journal_max_use"
+  printf '#\n'
+  printf '# MaxFileSec bounds how long one journal file stays active. It matters because deletion works on\n'
+  printf '# whole ARCHIVED files and never on the active one, so an entry can outlive MaxRetentionSec by up\n'
+  printf '# to one file. %s caps that overshoot at about a day instead of the default month.\n' "$journal_max_file_sec"
+  printf '[Journal]\n'
+  printf 'Storage=persistent\n'
+  printf 'SystemMaxUse=%s\n' "$journal_max_use"
+  printf 'SystemMaxFileSize=%s\n' "$journal_max_file_size"
+  printf 'MaxFileSec=%s\n' "$journal_max_file_sec"
+  printf 'MaxRetentionSec=%s\n' "$journal_retention"
+}
+
+# The value systemd actually resolves, not the value this script hoped for. cat-config replays the whole
+# chain -- main file, then every drop-in in filename order across /etc, /run and /usr/lib -- so the last
+# assignment it prints is the one journald reads.
+journal_effective(){
+  systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+    | sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\(.*\)\$/\1/p" | tail -1
+}
+
+# Every file in the chain except this deployment's own that already has an opinion about one of the keys
+# below. Used to refuse rather than silently overwrite an operator's journald policy: this is host
+# configuration on a host that may be running services which have nothing to do with OpenPPWR.
+journal_conflicts(){
+  for candidate in /etc/systemd/journald.conf "$JOURNAL_DROPIN_DIR"/*.conf \
+                   /run/systemd/journald.conf.d/*.conf /usr/lib/systemd/journald.conf.d/*.conf; do
+    if [ ! -f "$candidate" ]; then continue; fi
+    if [ "$candidate" = "$JOURNAL_DROPIN" ]; then continue; fi
+    grep -HnE "^[[:space:]]*($JOURNAL_KEYS)[[:space:]]*=" "$candidate" 2>/dev/null || true
+  done
+}
+
+# Proving the setting took is the whole point of this function, and there are two separate ways it can
+# fail to, which is why there are two separate checks.
+#
+# (1) Another drop-in sorting after this one wins the key. cat-config sees that.
+#
+# (2) journald cannot parse a value, ignores it, and silently keeps its own default. cat-config CANNOT see
+#     that -- it reports what the files say, not what journald accepted. Observed directly on Debian 13:
+#     SystemKeepFree=15% produced "Failed to parse SystemKeepFree=15%, ignoring: Invalid argument" and the
+#     4G default stayed in force. A retention promise defeated by a typo, with the only evidence one line
+#     in the journal, is exactly the failure this whole task exists to prevent, so the journal is asked.
+journal_verify(){
+  journal_state=$1
+  journal_want_retention=${OPENPPWR_JOURNAL_RETENTION:-30day}
+  journal_want_max_use=${OPENPPWR_JOURNAL_MAX_USE:-1G}
+  journal_got_retention=$(journal_effective MaxRetentionSec)
+  journal_got_max_use=$(journal_effective SystemMaxUse)
+  journal_got_storage=$(journal_effective Storage)
+  [ "$journal_got_retention" = "$journal_want_retention" ] \
+    || fail "journald resolves MaxRetentionSec=$journal_got_retention, not $journal_want_retention; another drop-in in /etc, /run or /usr/lib sorts after $JOURNAL_DROPIN and overrides it. The retention period is NOT in force" 132
+  [ "$journal_got_max_use" = "$journal_want_max_use" ] \
+    || fail "journald resolves SystemMaxUse=$journal_got_max_use, not $journal_want_max_use; another drop-in overrides it and the size bound is not the one documented" 132
+  [ "$journal_got_storage" = persistent ] \
+    || fail "journald resolves Storage=$journal_got_storage, not persistent; a volatile journal keeps nothing across a reboot and no retention period is being enforced" 132
+  # Scoped to the *running* journald instance, not to the boot. Scanning the whole boot made this check
+  # fire on a parse failure from an earlier, since-corrected version of this same file -- the path matches
+  # for the file's whole history, so a refusal that was fixed minutes ago still looked current. Found by
+  # running this function on Debian 13 against a host that had previously been handed a bad value at this
+  # path: it failed 133 while the file on disk was clean. ActiveEnterTimestamp is when the journald now
+  # running started, so only what that instance said about this file counts.
+  journal_started=$(systemctl show systemd-journald -p ActiveEnterTimestamp --value 2>/dev/null)
+  if [ -n "$journal_started" ] \
+     && journalctl -b _COMM=systemd-journal --since "$journal_started" --no-pager 2>/dev/null \
+        | grep -q "$JOURNAL_DROPIN.*Failed to parse"; then
+    fail "journald refused a value in $JOURNAL_DROPIN and silently kept its own default; run: journalctl -b _COMM=systemd-journal --since '$journal_started' | grep 'Failed to parse'" 133
+  fi
+  journal_persistent_dir=no; [ -d /var/log/journal ] && journal_persistent_dir=yes
+  printf 'JOURNAL_RETENTION_PASS state=%s dropin=%s retention=%s max_use=%s storage=%s persistent_dir=%s promise=%s-or-%s-whichever-first\n' \
+    "$journal_state" "$JOURNAL_DROPIN" "$journal_got_retention" "$journal_got_max_use" \
+    "$journal_got_storage" "$journal_persistent_dir" "$journal_want_retention" "$journal_want_max_use"
+}
+
+journal_retention(){
+  need_root; need systemctl; need systemd-analyze; need journalctl
+  case "${1:-apply}" in
+    show)
+      [ -f "$JOURNAL_DROPIN" ] || fail "no OpenPPWR journald drop-in is installed; run: openppwr-installer journal-retention apply" 130
+      journal_verify installed
+      return 0
+      ;;
+    apply) ;;
+    *) fail 'usage: openppwr-installer journal-retention apply|show' 130;;
+  esac
+  umask 022
+  # Staged outside $JOURNAL_DROPIN_DIR, not inside it. Staging in place meant the directory had to be
+  # created before the two refusals below could run, so a host that refused was still left with a new
+  # /etc/systemd/journald.conf.d that this installer had made -- while the refusal said "Nothing has been
+  # changed". Small, but the message has to be true for the refusal to be worth anything.
+  journal_pending=$(mktemp) || fail 'cannot create a working file' 130
+  trap 'rm -f "$journal_pending"' 0 1 2 15
+  journal_retention_body > "$journal_pending"
+  if [ -f "$JOURNAL_DROPIN" ]; then
+    # A file at this exact path that this installer did not write belongs to the operator, whatever it
+    # says. Overwriting it silently is the failure mode this check exists for.
+    if ! head -1 "$JOURNAL_DROPIN" | grep -qF "$JOURNAL_MARKER"; then
+      fail "$JOURNAL_DROPIN exists and was not written by this installer; move it aside or merge it by hand. Nothing has been changed" 131
+    fi
+    # Idempotent: identical bytes means no write and no journald restart, but the verification still runs,
+    # because "the file is right" and "the setting is in force" are different claims and only the second
+    # one matters.
+    if cmp -s "$journal_pending" "$JOURNAL_DROPIN"; then
+      rm -f "$journal_pending"; trap - 0 1 2 15
+      journal_verify unchanged
+      return 0
+    fi
+  fi
+  journal_found_conflicts=$(journal_conflicts)
+  if [ -n "$journal_found_conflicts" ] && [ "${OPENPPWR_CONFIRM_JOURNAL_OVERRIDE:-}" != yes ]; then
+    printf '%s: this host already configures journald retention or storage elsewhere:\n' "$PROGRAM" >&2
+    printf '%s\n' "$journal_found_conflicts" >&2
+    printf '%s\n' 'This host may run services that are nothing to do with OpenPPWR, and a journald policy is' >&2
+    printf '%s\n' 'host-wide. Review those lines, then set OPENPPWR_CONFIRM_JOURNAL_OVERRIDE=yes to proceed, or' >&2
+    printf '%s\n' 'OPENPPWR_SKIP_JOURNAL_RETENTION=yes to leave journald alone and accept that this deployment' >&2
+    printf '%s\n' 'enforces no log retention period at all.' >&2
+    fail 'refusing to change an existing journald configuration without confirmation. Nothing has been changed' 131
+  fi
+  # Created here, past every refusal, so the two "Nothing has been changed" paths above really change
+  # nothing on the host -- not even an empty directory.
+  install -d -m 0755 "$JOURNAL_DROPIN_DIR"
+  install -m 0644 "$journal_pending" "$JOURNAL_DROPIN"
+  rm -f "$journal_pending"; trap - 0 1 2 15
+  # Restart, not reload: journald re-reads these limits only at start.
+  systemctl restart systemd-journald
+  journal_verify applied
+}
+
+verify_archive(){
+  archive=${1:-}; expected=${2:-}
+  [ -f "$archive" ] || fail 'release archive does not exist' 32
+  [ ${#expected} -eq 64 ] || fail '64-character SHA-256 is required' 33
+  actual=$(sha256sum "$archive" | awk '{print $1}')
+  [ "$actual" = "$expected" ] || fail 'release archive checksum mismatch' 34
+  printf 'ARCHIVE_VERIFY_PASS sha256=%s\n' "$actual"
+}
+
+# Writing the environment file is a separate function so it can be tested without root, Docker or an image.
+#
+# An earlier version put shell conditionals inside the `printf` format literal, so the environment file
+# received "if [ -n ... ]; then" lines instead of assignments. `bash -n` passed, because the syntax was valid.
+# The validator checked only syntax and checksums, so nobody noticed. The validator now
+# generates the file and checks that every line is a comment or a KEY=value assignment.
+write_env_file(){
+  target="$1"; image="$2"; db="$3"; runtime="$4"; bootstrap="$5"; auth="$6"; maintenance="$7"; worker_db="$8"; worker_token="${9:-UNCONFIGURED}"; host_map="${10:-}"; compose_project="${11:-openppwr-community}"; demo_password="${12:-}"; demo_email_domain="${13:-}"; rotation="${14:-}"
+  {
+    printf '# For this OpenPPWR deployment only. Do not share it and do not commit it.\n'
+    printf 'OPENPPWR_COMPOSE_PROJECT=%s\n' "$compose_project"
+    printf '# Immutable application image. A latest tag is refused.\nOPENPPWR_IMAGE=%s\n' "$image"
+    printf '# The application listens on loopback only, for a reverse proxy in front of it.\nOPENPPWR_BIND_ADDRESS=127.0.0.1\nOPENPPWR_WEB_PORT=%s\n' "${OPENPPWR_WEB_PORT:-31114}"
+    printf '# Password for the privileged PostgreSQL migration user.\nOPENPPWR_DB_PASSWORD=%s\n' "$db"
+    printf '# Password for the unprivileged application role, under FORCE ROW LEVEL SECURITY.\nOPENPPWR_RUNTIME_DATABASE_PASSWORD=%s\n' "$runtime"
+    printf '# One-time secret that bootstraps the synthetic ACME tenant.\nOPENPPWR_BOOTSTRAP_TOKEN=%s\n' "$bootstrap"
+    printf '# Worker bearer token. UNCONFIGURED until bootstrap-acme has run.\nOPENPPWR_WORKER_TOKEN=%s\n' "$worker_token"
+    printf '# The worker database identity. Sharing the API role made the retention boundary decorative.\nOPENPPWR_WORKER_DATABASE_PASSWORD=%s\n' "$worker_db"
+    # Written unconditionally, outside the demonstration branch below, and that placement is the point. A
+    # leaked credential is a production problem — before this role existed, replacing one meant destroying
+    # the tenant. The role holds EXECUTE on one function and nothing else: no table grant, no column grant,
+    # no session issuance. That is why a production API process may load it where it must not load the
+    # session-issuing credential, which is authority by itself.
+    printf '# Replaces one identity credential. Holds EXECUTE on that one function and nothing else.\nOPENPPWR_ROTATION_DATABASE_PASSWORD=%s\n' "$rotation"
+    if [ -n "$auth" ]; then
+      # The demonstration profile has to switch itself on. Without this line the installer wrote the
+      # privileged passwords and the API then refused to start with the URLs it had just been given.
+      printf '# Demonstration sign-in. Enabled only by the demonstration profile.\nOPENPPWR_DEMO_LOGIN=true\n'
+      printf '# The role that issues a session once a credential verifies. The request role cannot assume it.\nOPENPPWR_AUTH_DATABASE_PASSWORD=%s\n' "$auth"
+      # Never persisted before this line: an operator who supplied a custom demonstration
+      # password or email domain at configure time had it silently discarded, and every fresh shell after
+      # got the API's own public fallback ("demo" / "dummymail.example") instead of what was actually asked
+      # for — indistinguishable from success unless someone thought to check.
+      if [ -n "$demo_password" ]; then
+        printf '# Demonstration sign-in password. Defaults to the published value "demo" when unset.\nOPENPPWR_DEMO_PASSWORD=%s\n' "$demo_password"
+      fi
+      if [ -n "$demo_email_domain" ]; then
+        printf '# Mail domain for demonstration accounts. Defaults to "dummymail.example" when unset.\nOPENPPWR_DEMO_EMAIL_DOMAIN=%s\n' "$demo_email_domain"
+      fi
+    fi
+    if [ -n "$maintenance" ]; then
+      printf '# The demonstration reset role. A deployment holding production data removes it.\nOPENPPWR_MAINTENANCE_DATABASE_PASSWORD=%s\n' "$maintenance"
+    fi
+    if [ -n "$host_map" ]; then
+      # Reconfiguring a mapped deployment without this line would silently replace fail-closed host
+      # routing with permissive single-host mode — this is not a secret, but every other
+      # regenerated env file field is preserved across reconfigure, and this one was not.
+      printf '# Hostname-to-surface map. Absent means one host serves every surface.\nOPENPPWR_HOST_MAP=%s\n' "$host_map"
+    fi
+  } > "$target"
+}
+
+read_generated_env_secret(){
+  file="$1"; requested="$2"
+  awk -v requested="$requested" '
+    {
+      sub(/\r$/, "", $0)
+      if ($0 == "" || $0 ~ /^#/) next
+      if ($0 !~ /^[A-Z][A-Z0-9_]*=.*/) {
+        print "openppwr-installer: existing environment file has ambiguous or invalid dotenv syntax at line " NR > "/dev/stderr"
+        failed=1
+        next
+      }
+      separator=index($0, "=")
+      key=substr($0, 1, separator-1)
+      value=substr($0, separator+1)
+      seen[key]++
+      if (seen[key] > 1) {
+        print "openppwr-installer: existing environment file defines " key " more than once" > "/dev/stderr"
+        failed=1
+      }
+      if (key == requested) {
+        found++
+        selected=value
+      }
+    }
+    END {
+      if (failed) exit 42
+      if (found != 1) {
+        print "openppwr-installer: existing environment file must define " requested " exactly once" > "/dev/stderr"
+        exit 42
+      }
+      if (length(selected) != 64 || selected ~ /[^0-9a-f]/) {
+        print "openppwr-installer: existing " requested " is not a generated 64-character lowercase hexadecimal secret" > "/dev/stderr"
+        exit 42
+      }
+      print selected
+    }
+  ' "$file"
+}
+
+configure(){
+  need_root; need openssl
+  image=${1:-${OPENPPWR_IMAGE:-}}
+  validate_image "$image"
+  [ -f "$COMPOSE_FILE" ] || fail 'run install first' 40
+  if [ -f "$ENV_FILE" ] && [ "${OPENPPWR_CONFIRM_RECONFIGURE:-}" != yes ]; then fail 'configuration exists; set OPENPPWR_CONFIRM_RECONFIGURE=yes to replace it' 41; fi
+  umask 077
+  # The migration credential belongs to the initialised cluster. Reconfiguring generated a new one that
+  # PostgreSQL does not know, so the migration could not connect and the optional roles were never withdrawn.
+  # Where a configuration already exists, the existing credentials are preserved.
+  if [ -f "$ENV_FILE" ]; then
+    # Generated files use strict dotenv assignments. Leading whitespace and duplicate active definitions
+    # are rejected rather than interpreted by whichever grep happens to run first. The preserved migration
+    # credential must retain the exact format produced by `secret`.
+    db=$(read_generated_env_secret "$ENV_FILE" OPENPPWR_DB_PASSWORD) || exit $?
+    # grep/cut preserves the complete bearer value; tr removes CR from a CRLF-generated file. The strict
+    # parser above has already rejected duplicate or malformed assignments before this value is trusted.
+    worker_token=$(grep '^OPENPPWR_WORKER_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r')
+    [ -n "$worker_token" ] || fail 'existing environment file has no worker token' 42
+    # An explicit OPENPPWR_HOST_MAP this invocation overrides; otherwise the existing mapped deployment's
+    # fail-closed routing survives reconfigure instead of silently reverting to permissive single-host mode.
+    host_map="${OPENPPWR_HOST_MAP:-$(grep '^OPENPPWR_HOST_MAP=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r')}"
+    # Same preserve-unless-overridden rule as the host map: an explicit value this invocation overrides,
+    # otherwise whatever the deployment already has survives reconfigure instead of silently reverting to
+    # the API's own public fallback ("demo" / "dummymail.example") the moment configure runs again without
+    # them.
+    existing_demo_password=$(grep '^OPENPPWR_DEMO_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r')
+    existing_demo_email_domain=$(grep '^OPENPPWR_DEMO_EMAIL_DOMAIN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r')
+    # An env file predating this default-persistence fix can still have no line at all for either value,
+    # in which case the API's own fallback ("demo" / "dummymail.example") is what actually got hashed at
+    # bootstrap even though nothing on disk said so. Assume that fallback explicitly
+    # here rather than treating an absent line as "no opinion" — otherwise the guard below never fires for
+    # exactly the deployments that most need it: the ones that took every default.
+    existing_demo_password="${existing_demo_password:-demo}"
+    existing_demo_email_domain="${existing_demo_email_domain:-dummymail.example}"
+    demo_password="${OPENPPWR_DEMO_PASSWORD:-$existing_demo_password}"
+    demo_email_domain="${OPENPPWR_DEMO_EMAIL_DOMAIN:-$existing_demo_email_domain}"
+    # bootstrap-acme hashes whatever this value is *once*, into demo_users, and there is no re-bootstrap
+    # path to re-hash it later. A reconfigure that changed it after bootstrap already ran would make
+    # /v1/demo/accounts advertise a password /v1/login no longer accepts — the accounts would still exist,
+    # signed in with the *original* password, silently. This divergence is one the persistence fix above made
+    # reachable rather than one that existed before: nothing previously persisted long enough for a later
+    # reconfigure to disagree with it. Refused rather than silently accepted.
+    #
+    # Gated on the worker token rather than on state/acme-bootstrap.json: bootstrap-acme rewrites
+    # OPENPPWR_WORKER_TOKEN in this same env file the moment it succeeds (see bootstrap_acme below), so
+    # this signal lives exactly where the rest of this check already looks, and survives the state
+    # directory's marker file being lost, moved or deleted independently of the env file — the marker file
+    # is not the only, or even the most durable, record that bootstrap ran.
+    if [ "$worker_token" != UNCONFIGURED ]; then
+      if [ "$demo_password" != "$existing_demo_password" ]; then
+        fail 'OPENPPWR_DEMO_PASSWORD cannot change after bootstrap-acme has run; the password already hashed into the demonstration accounts cannot be re-hashed without a fresh bootstrap' 43
+      fi
+      if [ "$demo_email_domain" != "$existing_demo_email_domain" ]; then
+        fail 'OPENPPWR_DEMO_EMAIL_DOMAIN cannot change after bootstrap-acme has run; the demonstration accounts already carry the original addresses' 43
+      fi
+    fi
+    # Unlike the host map, the compose project name is never taken from this invocation's environment on a
+    # reconfigure: it names the containers, volumes and networks the running deployment already uses, and
+    # changing it here would silently stand up a second, disconnected set beside the first rather than
+    # reconfigure the one that exists. Always the value already on disk.
+    compose_project=$(grep '^OPENPPWR_COMPOSE_PROJECT=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r')
+    [ -n "$compose_project" ] || compose_project=openppwr-community
+  else
+    db=$(secret)
+    worker_token=UNCONFIGURED
+    host_map="${OPENPPWR_HOST_MAP:-}"
+    demo_password="${OPENPPWR_DEMO_PASSWORD:-}"
+    demo_email_domain="${OPENPPWR_DEMO_EMAIL_DOMAIN:-}"
+    # First configure only: this is where an operator names a second, independent stack (see
+    # a second, independent stack on the same host). The old hardcoded `openppwr-community` here
+    # meant every such stack's generated env file claimed the default project regardless of what the
+    # operator actually ran `docker compose` against, so any later installer command run without also
+    # re-exporting the same override could silently resolve to a *different* deployment's containers.
+    compose_project="${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}"
+  fi
+  runtime=$(secret); bootstrap=$(secret); worker_db=$(secret); rotation=$(secret)
+  # The privileged credentials exist only for the demonstration profile. A deployment holding real data
+  # neither generates nor loads them: separated grants in the database achieve nothing if both credentials
+  # sit in the long-running API process.
+  if [ "${OPENPPWR_DEMO_LOGIN:-}" = true ]; then auth=$(secret); maintenance=$(secret); else auth=; maintenance=; fi
+  # Resolve to the API's own literal fallback here, once, rather than leaving it empty for
+  # write_env_file to omit: an omitted line meant a later reconfigure's "existing value" read back empty
+  # and skipped the post-bootstrap guard above entirely for every deployment that took the default
+  # instead of setting one explicitly — the exact case the guard exists for.
+  if [ -n "$auth" ]; then
+    demo_password="${demo_password:-demo}"
+    demo_email_domain="${demo_email_domain:-dummymail.example}"
+  fi
+  pending="$ENV_FILE.pending.$$"
+  trap 'rm -f "$pending"' 0 1 2 15
+  write_env_file "$pending" "$image" "$db" "$runtime" "$bootstrap" "$auth" "$maintenance" "$worker_db" "$worker_token" "$host_map" "$compose_project" "$demo_password" "$demo_email_domain" "$rotation"
+  chmod 0600 "$pending"; chown root:root "$pending"
+
+  transitioning=false
+  transition_marker="$STATE_DIR/production-transition.pending"
+  if [ -z "$auth" ] && { [ -f "$transition_marker" ] || { [ -f "$ENV_FILE" ] \
+     && grep -Eq '^(OPENPPWR_DEMO_LOGIN=true|OPENPPWR_AUTH_DATABASE_PASSWORD=|OPENPPWR_MAINTENANCE_DATABASE_PASSWORD=)' "$ENV_FILE"; }; }; then
+    transitioning=true
+  fi
+
+  if [ "$transitioning" = true ]; then
+    # Fail-closed sequence. Old API stops while its privileged URLs and roles still work. New production env
+    # is installed atomically. Synchronous migration retires both roles with NOLOGIN PASSWORD NULL before
+    # API restarts.
+    #
+    # "archived_credentials_invalidated=true" below is a claim about the database role, not about any file.
+    # A backup taken with `backup` while this was still a demonstration deployment still contains the old
+    # OPENPPWR_AUTH_DATABASE_PASSWORD / OPENPPWR_MAINTENANCE_DATABASE_PASSWORD bytes, and this transition does
+    # not locate, redact or rotate those archives — they are outside a single `configure` invocation's scope,
+    # and only the operator knows where they were copied. What is genuinely true is that the string in such a
+    # backup no longer authenticates anything: the role it belonged to has NOLOGIN and no password. The
+    # residual is disclosure of a formerly valid secret, not a live credential.
+    # Marker precedes every state-changing stage. If this process dies after replacing the env, the next
+    # configure resumes retirement and restart instead of mistaking the production-shaped env for success.
+    if [ ! -f "$transition_marker" ]; then
+      printf 'demo-to-production\n' > "$transition_marker"
+      chmod 0600 "$transition_marker"
+    fi
+    compose stop api worker
+    mv -f "$pending" "$ENV_FILE"
+    compose up -d postgres clamav
+    compose run --rm migrate
+    retired=$(compose exec -T postgres psql -U openppwr_migrator -d openppwr -Atqc \
+      "SELECT count(*) FROM pg_roles WHERE rolname IN ('openppwr_auth','openppwr_maintenance') AND (rolcanlogin OR rolpassword IS NOT NULL)")
+    [ "$retired" = 0 ] || fail 'production transition did not retire privileged database roles; API remains stopped' 43
+    compose up -d api web
+    if ! grep -q '^OPENPPWR_WORKER_TOKEN=UNCONFIGURED$' "$ENV_FILE"; then compose up -d worker; fi
+    [ -n "$(compose ps --status running -q api)" ] || fail 'production API did not restart; privileged roles are retired' 44
+    verify
+    rm -f "$transition_marker"
+    printf 'CONFIGURE_TRANSITION_PASS from=demo to=production api_restarted=true privileged_roles_retired=true archived_credentials_invalidated=true\n'
+  else
+    mv -f "$pending" "$ENV_FILE"
+  fi
+  trap - 0 1 2 15
+  record_image_digest "$image"
+  printf 'CONFIGURE_PASS env=%s mode=600 secrets_printed=false\n' "$ENV_FILE"
+}
+
+start(){
+  need_root; [ -f "$ENV_FILE" ] || fail 'run configure first' 50
+  compose up -d postgres clamav migrate api web
+  # The worker is excluded before bootstrap because it has no token yet. Once bootstrap has
+  # configured one, start must bring it back too: after `uninstall` followed by `start` the
+  # worker would otherwise stay down and `verify` would fail on an already-bootstrapped
+  # deployment, pointing the operator at a bootstrap step that is no longer applicable.
+  if ! grep -q '^OPENPPWR_WORKER_TOKEN=UNCONFIGURED$' "$ENV_FILE"; then
+    compose up -d worker
+  fi
+  compose ps
+}
+
+# Creates the deployment's one tenant.
+#
+# `bootstrap-acme` was the only way to reach a working deployment, and its slug and name were written
+# into the request body. So the single documented path to a running system produced a fictional company,
+# and an operator wanting their own had to find an undocumented HTTP route and then replicate by hand the
+# worker-token installation and the evidence-volume marker below -- both of which a deployment is quietly
+# broken without. `bootstrap-acme` is now this function called with the demonstration's arguments.
+#
+# The response file keeps the name `acme-bootstrap.json` on every tenant. It is the wrong name for a real
+# one and it stays: `backup`, `restore` and `rollback` each name it literally, so renaming it here would
+# drop the identities file out of the backup set silently. A wrong name is recoverable in a way an
+# incomplete backup is not.
+#
+# $1 slug, $2 name, $3 disclaimer, $4 seed demonstration data (true/false).
+# Records the digest of the image this deployment actually runs, into the environment file that
+# `/v1/version` reads.
+#
+# It used to live inside `upgrade` and nowhere else, so a deployment reported `imageDigest: unknown`
+# from installation until somebody upgraded it -- and a first install is the common case for a
+# self-hoster, while /v1/version is the first thing they would check to confirm what is running. The
+# original defect was that this field reported a stale digest; the fix was applied to one of the two
+# paths that set the image, which left the other reporting nothing at all.
+#
+# Read from the image rather than from the reference, because a tag is a name and the digest is the
+# fact. A registry-backed image has a RepoDigest, which is what a puller can verify; a locally built
+# one has only its Id, which is what this deployment can honestly claim. If neither can be read the
+# field is left absent, because `unknown` is the truthful answer when it cannot be known, and a stale
+# value would be worse than an honest absence.
+record_image_digest(){
+  record_image=$1
+  record_digest=$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}' "$record_image" 2>/dev/null | sed 's/.*@//')
+  sed -i '/^OPENPPWR_IMAGE_DIGEST=/d' "$ENV_FILE"
+  [ -n "$record_digest" ] || return 0
+  printf '# Digest of the image this deployment runs. Refreshed by configure and by every upgrade.\nOPENPPWR_IMAGE_DIGEST=%s\n' "$record_digest" >> "$ENV_FILE"
+}
+
+bootstrap_tenant(){
+  need_root; [ -f "$ENV_FILE" ] || fail 'run configure first' 60
+  slug=$1; tenant_name=$2; tenant_disclaimer=$3; seed=$4
+  # Validated here rather than left to the API, because the failure is one-way: bootstrap is a
+  # whole-deployment operation that cannot be repeated, so a slug rejected after the tenant row exists
+  # leaves a deployment that has to be wiped before it can be tried again.
+  case $slug in
+    ''|*[!a-z0-9-]*) fail 'slug must be lowercase letters, digits and hyphens' 63;;
+  esac
+  [ -n "$tenant_name" ] || fail 'tenant name is required' 63
+  # The name goes into a JSON body assembled by printf, so the two characters that would break out of it
+  # are refused rather than escaped. Escaping correctly in shell is possible and this is not the place to
+  # prove it.
+  case $tenant_name in
+    *'"'*|*'\'*) fail 'tenant name must not contain quote or backslash characters' 63;;
+  esac
+  umask 077; response="$STATE_DIR/acme-bootstrap.json"
+  bootstrap=$(sed -n 's/^OPENPPWR_BOOTSTRAP_TOKEN=//p' "$ENV_FILE")
+  port=$(sed -n 's/^OPENPPWR_WEB_PORT=//p' "$ENV_FILE")
+  # Bootstrap is a one-time, whole-deployment operation: once a tenant exists the API answers
+  # 409 forever. If a previous attempt created the tenant but failed afterwards, re-running must
+  # resume from the stored response instead of calling the API again, otherwise the deployment
+  # is permanently stuck with an unconfigured worker token and no way forward.
+  if [ -s "$response" ] && grep -q '"identities"' "$response" 2>/dev/null; then
+    printf 'BOOTSTRAP_RESUME existing_identities=%s\n' "$response"
+  else
+    # Never redirect curl straight onto the response file: the shell truncates it before curl
+    # runs, so a failed retry would destroy identities that cannot be recovered, because tokens
+    # are only ever stored hashed. Write to a temporary file and move it into place on success.
+    pending="$response.partial"
+    rm -f "$pending"
+    request=$(printf '{"slug":"%s","name":"%s","disclaimer":"%s"}' "$slug" "$tenant_name" "$tenant_disclaimer")
+    if ! curl --fail --silent --show-error --max-time 30 -H 'content-type: application/json' -H "x-openppwr-bootstrap-token: $bootstrap" --data "$request" "http://127.0.0.1:$port/v1/bootstrap" > "$pending"; then
+      rm -f "$pending"
+      [ -s "$response" ] || fail 'bootstrap request failed and no previous identities exist; if the tenant already exists its tokens cannot be recovered and the database must be reset' 62
+      fail 'bootstrap request failed; previous identities were preserved' 62
+    fi
+    grep -q '"identities"' "$pending" || { rm -f "$pending"; fail 'bootstrap response did not contain identities' 61; }
+    chmod 0600 "$pending"
+    mv -f "$pending" "$response"
+  fi
+  chmod 0600 "$response"
+  image=$(sed -n 's/^OPENPPWR_IMAGE=//p' "$ENV_FILE")
+  # The bootstrap response holds live tokens and stays mode 600 root-only. The runtime image
+  # runs as UID 65532, which therefore cannot read it, so this one ephemeral, network-less,
+  # read-only container is run as root purely to parse a local file. The file's permissions are
+  # not relaxed, and nothing is written from this container.
+  worker=$(docker run --rm --user 0:0 --network none --entrypoint /nodejs/bin/node -v "$STATE_DIR:/state:ro" "$image" -e "const x=require('/state/acme-bootstrap.json');process.stdout.write(x.identities.worker.token)")
+  [ -n "$worker" ] || fail 'bootstrap response did not contain worker identity' 61
+  sed -i "s/^OPENPPWR_WORKER_TOKEN=.*/OPENPPWR_WORKER_TOKEN=$worker/" "$ENV_FILE"
+  unset worker bootstrap
+  # A marker written once, here, at the one point in a deployment's life that is unambiguously "this
+  # evidence volume belongs to this deployment": bootstrap has just succeeded, so whatever volume is
+  # mounted right now is the real one. The worker's retention sweep requires this marker before it will
+  # treat a missing file as evidence of deletion — an unmounted filesystem or a wrong volume
+  # commonly presents as an empty, perfectly *accessible* directory, which a plain reachability check
+  # cannot tell apart from genuine absence. A volume that has never been through this line is never
+  # trusted for that decision, deliberately: this is not written on every start, only here, so a volume
+  # silently swapped for a different one later still fails the check rather than acquiring the marker by
+  # accident.
+  # Written into `evidence/`, not the volume root: the volume mounts at container path
+  # `/var/lib/openppwr`, but `OPENPPWR_EVIDENCE_STORAGE_ROOT` — what the worker actually checks — is
+  # `/var/lib/openppwr/evidence`, one directory deeper (deploy/community/docker-compose.yml). Writing the
+  # marker at the volume root left it one level above where the worker ever looks, so this fix did nothing
+  # for a real deployment while its own test fixtures (which set storageRoot and the marker to the same
+  # path) never exercised that offset and so never caught it.
+  project=$(sed -n 's/^OPENPPWR_COMPOSE_PROJECT=//p' "$ENV_FILE"); volume="$project-evidence"
+  mount=$(docker volume inspect -f '{{.Mountpoint}}' "$volume")
+  install -d -m 0700 "$mount/evidence"
+  [ -f "$mount/evidence/.openppwr-storage-initialized" ] || printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$mount/evidence/.openppwr-storage-initialized"
+  compose up -d worker
+  # Only the demonstration is seeded. A real tenant gets an empty catalogue, because loading a fictional
+  # supplier list into an organization's live deployment is worse than an empty screen.
+  [ "$seed" = true ] && seed_demonstration "$response" "$port"
+  printf 'BOOTSTRAP_PASS tenant=%s seeded=%s identities_file=%s mode=600 tokens_printed=false\n' "$slug" "$seed" "$response"
+}
+
+bootstrap_acme(){
+  bootstrap_tenant 'acme-eu-demo' 'ACME Packaging Europe GmbH' 'All companies, products, materials, suppliers and documents in this environment are fictional and generated exclusively for demonstration and testing.' true
+}
+
+# The production path, and the empty disclaimer is the whole of what distinguishes it: a tenant created
+# here asserts that its data is real, so its dossiers carry no line declaring them a demonstration. Every
+# other route into this function defaults to carrying one, including an empty request body.
+bootstrap_own(){
+  [ $# -ge 2 ] || fail 'usage: openppwr-installer bootstrap SLUG NAME' 63
+  bootstrap_tenant "$1" "$2" '' false
+}
+
+# Loads the ACME catalogue into the tenant `bootstrap-acme` has just created.
+#
+# Without this the command named `bootstrap-acme` produced an ACME tenant containing nothing: nine identities
+# and an empty catalogue. Every screen after sign-in read zero — no packaging, no evidence, no assessments —
+# and a dossier cannot be generated from an empty snapshot, so the demonstration demonstrated nothing. Found
+# by signing in to a freshly bootstrapped deployment and looking at it.
+#
+# The published walkthrough does open with an import, and that step keeps its point: the invalid sample still
+# exists to show the validation report, and the supplemental sample still shows a second import merging into
+# a populated catalogue. What it cannot also be is the only way the demonstration ever acquires data, because
+# then the first thing a new evaluator meets is six empty screens.
+#
+# Imported through the product's own HTTP route, with the `packaging_editor` credential, exactly as an
+# operator would: validated, and recorded in the audit chain. Seeding by writing rows into the database
+# directly would produce a catalogue whose history the audit chain cannot account for — in a product whose
+# central claim is a complete audit chain, that is not a shortcut worth taking.
+#
+# Idempotent by `idempotency-key`, so a re-run after a partial failure replays rather than doubling.
+#
+# Not fatal. The tenant and its identities already exist and `bootstrap-acme` cannot be run a second time
+# against this deployment, so aborting here would leave no way forward; and a deployment with an empty
+# catalogue is recoverable by importing through the interface, which is a documented step. It is reported
+# loudly instead, naming the command that repairs it.
+seed_demonstration(){
+  response="$1"; port="$2"
+  image=$(sed -n 's/^OPENPPWR_IMAGE=//p' "$ENV_FILE")
+  # `|| true`: a command substitution that fails is a failed simple command, and `set -e` would abort
+  # `bootstrap-acme` here — turning the one step this whole function documents as non-fatal into the fatal
+  # one. An unreadable identities file leaves the variable empty and is reported by the check below.
+  editor=$(seed_token "$image" packaging_editor || true)
+  if [ -z "$editor" ]; then
+    printf 'BOOTSTRAP_WARN demonstration_data=not_seeded reason=no_packaging_editor_identity repair=import-through-the-interface\n' >&2
+    return 0
+  fi
+  sample="$STATE_DIR/acme-import-valid.json"
+  if ! curl --fail --silent --show-error --max-time 30 "http://127.0.0.1:$port/downloads/acme-import-valid.json" -o "$sample"; then
+    rm -f "$sample"
+    unset editor
+    printf 'BOOTSTRAP_WARN demonstration_data=not_seeded reason=sample_not_served repair=import-through-the-interface\n' >&2
+    return 0
+  fi
+  chmod 0600 "$sample"
+  # --data-binary, not --data: the latter strips newlines, which changes the bytes being imported.
+  # The credential travels in a header on a loopback request and is never written to a file or an argument
+  # this script keeps.
+  if curl --fail --silent --show-error --max-time 60 -o /dev/null \
+      -H "Authorization: Bearer $editor" -H 'content-type: application/json' -H 'idempotency-key: openppwr-bootstrap-acme-catalogue' \
+      --data-binary "@$sample" "http://127.0.0.1:$port/v1/imports"; then
+    printf 'BOOTSTRAP_SEED_PASS dataset=acme-import-valid.json route=/v1/imports audited=true\n'
+    rm -f "$sample"
+    unset editor
+    seed_review_readiness "$port" "$image"
+    return 0
+  fi
+  printf 'BOOTSTRAP_WARN demonstration_data=not_seeded reason=import_refused repair=import-through-the-interface\n' >&2
+  rm -f "$sample"
+  unset editor
+}
+
+# Reads one identity's bearer token out of the bootstrap response and writes it to stdout.
+#
+# The response holds live tokens and stays mode 600 root-only. The runtime image runs as UID 65532, which
+# therefore cannot read it, so this one ephemeral, network-less, read-only container is run as root purely to
+# parse a local file. The file's permissions are not relaxed and nothing is written from the container. The
+# token leaves on stdout, into a shell variable: never a process argument, never a file this script leaves
+# behind, never the terminal. The role name in the `-e` script is a literal from this file, never a value
+# read back from the API.
+seed_token(){
+  docker run --rm --user 0:0 --network none --entrypoint /nodejs/bin/node -v "$STATE_DIR:/state:ro" "$1" \
+    -e "const x=require('/state/acme-bootstrap.json');const i=(x.identities||{})['$2'];process.stdout.write(i&&i.token?i.token:'')"
+}
+
+# Evaluates one expression against the JSON this deployment's own API just returned, and writes the result to
+# stdout. `read('name')` and `json('name')` reach files in the seeding work directory, which is mounted
+# read-only into a network-less container. The expression is a literal from this file: no API response, no
+# credential and no operator-supplied value is ever interpolated into it, so nothing the API returns can
+# become code here.
+seed_read(){
+  docker run --rm --user 0:0 --network none --entrypoint /nodejs/bin/node -v "$2:/seed:ro" "$1" \
+    -e "const fs=require('node:fs');const read=(n)=>fs.readFileSync('/seed/'+n,'utf8');const json=(n)=>JSON.parse(read(n));process.stdout.write(String($3))"
+}
+
+# Reports that the demonstration stopped at the catalogue, and clears everything the attempt was holding.
+seed_abandon(){
+  rm -rf "$seed_work"
+  unset seed_contributor seed_reviewer seed_manager
+  printf 'BOOTSTRAP_WARN demonstration_state=catalogue_only reason=%s repair=%s\n' "$1" \
+    'work-through-the-ACME-walkthrough-from-the-evidence-step' >&2
+}
+
+# Carries the freshly imported catalogue the rest of the way to the point a dossier can actually be produced:
+# supplier evidence uploaded, scanned, reviewed and accepted, and one assessment run over the whole
+# catalogue.
+#
+# Why this exists. With the catalogue alone, a fresh demonstration answers every assessment UNKNOWN and opens
+# nineteen gaps, and a review cannot be frozen while a gap is open — so reaching the dossier, the artifact
+# this product exists to produce, required an evaluator to upload evidence for eighteen requirements and
+# remediate nineteen findings by hand before seeing anything. Almost nobody did that, which meant the most
+# compelling part of the product was unreachable in its own demonstration.
+#
+# What it deliberately does not do. Two gaps are left open, and they are the two that no upload can close:
+# ACME-PKG-002 declares 5% recycled content against the rule's 30% minimum, and ACME-PKG-006 declares none at
+# all. Both are corrected by working the gap — assign, remediate, reassess — which is the step the walkthrough
+# asks for and the step a freeze cannot happen without. So the evaluator still does the real work, and still
+# earns the freeze; they just do not have to do the other eighteen first. The invalid sample is untouched and
+# still demonstrates the validation report, and the supplemental sample still merges into a populated
+# catalogue.
+#
+# Every action goes through the product's own HTTP routes under the credential whose role holds the
+# permission for it — `evidence_contributor` for `evidence:upload`, `evidence_reviewer` for `evidence:review`,
+# `compliance_manager` for `assessment:run` — for the same reason the import above does: a state the audit
+# chain cannot account for would falsify the one claim this product makes about itself.
+#
+# Idempotent. The uploads are recognised by their filename, which encodes the supplier, so a re-run reuses the
+# evidence a previous attempt left behind instead of stacking a second version on top of it; a file already
+# accepted is not reviewed twice; and the assessment is re-run only when this attempt actually changed
+# something or when no assessment exists yet.
+#
+# Not fatal, for the same reason the import is not: `bootstrap-acme` cannot be run twice against a deployment
+# whose tenant already exists, so a failure that aborted here would leave no way forward. Every exit reports
+# what stopped and points at the walkthrough, which reaches the same state by hand.
+seed_review_readiness(){
+  seed_port="$1"; seed_image="$2"
+  seed_api="http://127.0.0.1:$seed_port"
+  seed_work="$STATE_DIR/seed-work"
+  rm -rf "$seed_work"
+  if ! install -d -m 0700 "$seed_work"; then
+    printf 'BOOTSTRAP_WARN demonstration_state=catalogue_only reason=work_directory_unavailable repair=work-through-the-ACME-walkthrough-from-the-evidence-step\n' >&2
+    return 0
+  fi
+  seed_contributor=$(seed_token "$seed_image" evidence_contributor || true)
+  seed_reviewer=$(seed_token "$seed_image" evidence_reviewer || true)
+  seed_manager=$(seed_token "$seed_image" compliance_manager || true)
+  if [ -z "$seed_contributor" ] || [ -z "$seed_reviewer" ] || [ -z "$seed_manager" ]; then
+    seed_abandon missing_identities; return 0
+  fi
+
+  # The requirements the import derived, and the evidence this tenant already holds. Both read with the
+  # contributor credential, which holds `read` as well as `evidence:upload`.
+  if ! curl --fail --silent --show-error --max-time 30 -H "Authorization: Bearer $seed_contributor" \
+      "$seed_api/v1/evidence-requirements" -o "$seed_work/requirements.json"; then
+    seed_abandon requirements_unreadable; return 0
+  fi
+  if ! curl --fail --silent --show-error --max-time 30 -H "Authorization: Bearer $seed_contributor" \
+      "$seed_api/v1/evidence" -o "$seed_work/evidence-before.json"; then
+    seed_abandon evidence_unreadable; return 0
+  fi
+  # One requirement per supplier is enough, and that is a property of the rule rather than a shortcut: an
+  # assessment resolves a packaging record's evidence by supplier and evidence type, so one accepted
+  # declaration covers every packaging record that supplier owns. Four uploads therefore close eighteen
+  # findings. The first requirement of each supplier is taken from a list the API returns in a fixed order,
+  # and the suppliers are then sorted, so the same four requirements are chosen on every run.
+  seed_plan=$(seed_read "$seed_image" "$seed_work" \
+    "(()=>{const held=(json('evidence-before.json').items)||[];const reqs=(json('requirements.json').items)||[];const first=reqs.filter((r,i,a)=>a.findIndex((o)=>o.supplier_id===r.supplier_id)===i).sort((a,b)=>a.supplier_id<b.supplier_id?-1:a.supplier_id>b.supplier_id?1:0);return first.map((r)=>{const name='openppwr-seed-'+r.supplier_id+'.txt';const e=held.filter((v)=>v.normalized_filename===name).sort((p,q)=>Number(q.version)-Number(p.version))[0];return [r.supplier_id,r.id,r.evidence_type,e?e.id:'-',e?e.review_status:'-'].join(' ');}).join('\n');})()" || true)
+  if [ -z "$seed_plan" ]; then
+    seed_abandon no_evidence_requirements; return 0
+  fi
+  printf '%s\n' "$seed_plan" > "$seed_work/plan.txt"
+
+  # Uploads. `.txt` rather than a synthetic PDF on purpose: `text/plain` is a permitted evidence type whose
+  # declared type, extension and content signature all agree, and a reader who downloads it from the
+  # workbench gets something they can actually open and read, which a hand-assembled PDF header is not.
+  seed_changed=0
+  seed_uploaded=0
+  : > "$seed_work/wanted.txt"
+  : > "$seed_work/review.txt"
+  while IFS=' ' read -r seed_supplier seed_requirement seed_type seed_existing seed_review_status; do
+    [ -n "$seed_supplier" ] || continue
+    if [ "$seed_existing" != '-' ]; then
+      # A previous attempt already uploaded this supplier's declaration. Reuse it rather than adding a second
+      # version, so a re-run replays instead of doubling.
+      printf '%s\n' "$seed_existing" >> "$seed_work/wanted.txt"
+      [ "$seed_review_status" = accepted ] || printf '%s\n' "$seed_existing" >> "$seed_work/review.txt"
+      seed_uploaded=$((seed_uploaded + 1))
+      continue
+    fi
+    seed_file="$seed_work/openppwr-seed-$seed_supplier.txt"
+    {
+      printf '%s\n\n' 'FICTIONAL ACME SAMPLE — NOT A REAL COMPLIANCE DOCUMENT'
+      printf 'Recycled-content declaration for supplier %s.\n' "$seed_supplier"
+      printf '%s\n' 'Placed here by openppwr-installer bootstrap-acme so this demonstration starts with evidence'
+      printf '%s\n' 'already in place. Every organisation, supplier and figure named in this deployment is invented,'
+      printf '%s\n' 'and nothing in it may be used or presented as a compliance document.'
+    } > "$seed_file"
+    chmod 0600 "$seed_file"
+    if ! curl --fail --silent --show-error --max-time 60 < /dev/null \
+        -H "Authorization: Bearer $seed_contributor" \
+        -F "requirementId=$seed_requirement" -F "supplierId=$seed_supplier" -F "evidenceType=$seed_type" \
+        -F "file=@$seed_file;type=text/plain" \
+        "$seed_api/v1/evidence" -o "$seed_work/upload.json"; then
+      rm -f "$seed_file"
+      seed_abandon evidence_upload_refused; return 0
+    fi
+    rm -f "$seed_file"
+    seed_id=$(seed_read "$seed_image" "$seed_work" "json('upload.json').id||''" || true)
+    if [ -z "$seed_id" ]; then
+      seed_abandon evidence_upload_unidentified; return 0
+    fi
+    printf '%s\n' "$seed_id" >> "$seed_work/wanted.txt"
+    printf '%s\n' "$seed_id" >> "$seed_work/review.txt"
+    seed_uploaded=$((seed_uploaded + 1))
+    seed_changed=1
+  done < "$seed_work/plan.txt"
+
+  # The malware scan, which fails closed: an upload lands in quarantine with `scan_status=pending`, the worker
+  # claims the job, ClamAV answers, and only then may a reviewer accept it. So this waits for the verdict
+  # rather than assuming one — and it waits with a deadline, because a fresh deployment's ClamAV spends its
+  # first minutes loading signature databases and a wait with no bound would hang `bootstrap-acme` behind it.
+  # Five minutes at five-second intervals; the worker's own poll interval is one second, so the wait is
+  # ClamAV's readiness, not the queue's.
+  seed_scan=waiting
+  seed_attempt=0
+  while [ "$seed_attempt" -lt 60 ]; do
+    if curl --fail --silent --show-error --max-time 30 -H "Authorization: Bearer $seed_contributor" \
+        "$seed_api/v1/evidence" -o "$seed_work/evidence-now.json"; then
+      seed_scan=$(seed_read "$seed_image" "$seed_work" \
+        "(()=>{const want=read('wanted.txt').split('\n').filter(Boolean);const by=new Map(((json('evidence-now.json').items)||[]).map((e)=>[e.id,e.scan_status]));if(want.some((id)=>by.get(id)==='infected'))return 'infected';return want.length&&want.every((id)=>by.get(id)==='clean')?'clean':'waiting';})()" || true)
+      case "$seed_scan" in
+        clean) break;;
+        infected) break;;
+      esac
+    fi
+    seed_attempt=$((seed_attempt + 1))
+    sleep 5
+  done
+  if [ "$seed_scan" != clean ]; then
+    # `error` and `timeout` are retryable states the worker will come back to, so they are not distinguished
+    # here from "not finished yet": what the operator needs to know is that the verdict did not arrive inside
+    # the deadline, and that the uploads are sitting in quarantine where the walkthrough can pick them up.
+    seed_abandon "scan_not_clean_after_300s_state_$seed_scan"; return 0
+  fi
+
+  # Review. Accepting is refused unless the scan came back clean, which is why it happens only now.
+  seed_accepted=0
+  while IFS= read -r seed_id; do
+    [ -n "$seed_id" ] || continue
+    if ! curl --fail --silent --show-error --max-time 30 -o /dev/null < /dev/null \
+        -H "Authorization: Bearer $seed_reviewer" -H 'content-type: application/json' \
+        --data '{"decision":"accepted"}' "$seed_api/v1/evidence/$seed_id/review"; then
+      seed_abandon evidence_review_refused; return 0
+    fi
+    seed_accepted=$((seed_accepted + 1))
+    seed_changed=1
+  done < "$seed_work/review.txt"
+
+  # The assessment, run once over the whole catalogue. Skipped when this attempt changed nothing and a
+  # previous one already produced assessments, so a re-run replays rather than writing a second generation of
+  # superseding records.
+  if ! curl --fail --silent --show-error --max-time 60 -H "Authorization: Bearer $seed_manager" \
+      "$seed_api/v1/assessments?limit=1" -o "$seed_work/assessments.json"; then
+    seed_abandon assessments_unreadable; return 0
+  fi
+  seed_existing_assessments=$(seed_read "$seed_image" "$seed_work" "(((json('assessments.json').items)||[]).length)" || true)
+  if [ "$seed_changed" = 1 ] || [ "${seed_existing_assessments:-0}" = 0 ]; then
+    if ! curl --fail --silent --show-error --max-time 300 < /dev/null \
+        -H "Authorization: Bearer $seed_manager" -H 'content-type: application/json' \
+        --data '{}' "$seed_api/v1/assessments/run" -o "$seed_work/assessment.json"; then
+      seed_abandon assessment_refused; return 0
+    fi
+    seed_outcomes=$(seed_read "$seed_image" "$seed_work" \
+      "['PASS','FAIL','UNKNOWN','NOT_APPLICABLE'].map((k)=>k+':'+(((json('assessment.json').outcomes)||{})[k]||0)).join(',')" || true)
+  else
+    seed_outcomes=replayed
+  fi
+
+  if ! curl --fail --silent --show-error --max-time 60 -H "Authorization: Bearer $seed_manager" \
+      "$seed_api/v1/gaps?limit=500" -o "$seed_work/gaps.json"; then
+    seed_abandon gaps_unreadable; return 0
+  fi
+  seed_open=$(seed_read "$seed_image" "$seed_work" "(((json('gaps.json').items)||[]).filter((g)=>g.status!=='closed').length)" || true)
+  rm -rf "$seed_work"
+  unset seed_contributor seed_reviewer seed_manager
+  # The count is asserted, not merely reported. "Two gaps remain" is the promise this function makes to the
+  # walkthrough and to every document that describes the starting state; a run that produced some other number
+  # has produced a different demonstration, and saying so is more useful than printing whatever happened.
+  if [ "${seed_open:-}" != 2 ]; then
+    printf 'BOOTSTRAP_WARN demonstration_state=unexpected expected_open_gaps=2 open_gaps=%s repair=run-the-assessment-and-work-the-remaining-gaps-from-the-workbench\n' "${seed_open:-unknown}" >&2
+    return 0
+  fi
+  printf 'BOOTSTRAP_SEED_READY evidence=%s accepted=%s scan=clean outcomes=%s open_gaps=%s remaining=recycled-content-correction audited=true\n' \
+    "$seed_uploaded" "$seed_accepted" "${seed_outcomes:-unknown}" "$seed_open"
+}
+
+verify(){
+  need_root; [ -f "$ENV_FILE" ] || fail 'not configured' 70
+  compose ps --status running
+  port=$(sed -n 's/^OPENPPWR_WEB_PORT=//p' "$ENV_FILE")
+  curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:$port/health" >/dev/null
+  compose exec -T postgres pg_isready -U openppwr_migrator -d openppwr >/dev/null
+  worker_id=$(compose ps -q worker)
+  [ -n "$worker_id" ] || fail 'worker is not running; run bootstrap-acme' 71
+  worker_health=''
+  for attempt in $(seq 1 30); do
+    worker_health=$(docker inspect -f '{{.State.Health.Status}}' "$worker_id")
+    [ "$worker_health" = healthy ] && break
+    sleep 2
+  done
+  [ "$worker_health" = healthy ] || fail 'worker did not become healthy; inspect worker logs' 71
+  printf 'VERIFY_PASS web=healthy database=ready worker=healthy\n'
+}
+
+# Generates the backup key pair, or adopts one this operator already holds, and proves the pair actually
+# works before anything is allowed to depend on it. A recipient certificate that cannot be decrypted by the
+# key filed against it is the worst possible outcome — every backup taken afterwards looks like a success
+# and none of them is recoverable — so the round trip below is not optional and not a separate command.
+backup_key(){
+  need_root; need openssl
+  action=${1:-}
+  case "$action" in
+    show)
+      [ -f "$BACKUP_RECIPIENT" ] || fail 'no backup recipient is configured; run: openppwr-installer backup-key init' 85
+      printf 'BACKUP_KEY_RECIPIENT file=%s public_key_sha256=%s\n' "$BACKUP_RECIPIENT" "$(recipient_fingerprint "$BACKUP_RECIPIENT")"
+      return 0
+      ;;
+    init) ;;
+    *) fail 'usage: openppwr-installer backup-key init|show' 85;;
+  esac
+  [ -d "$ROOT/secrets" ] || fail 'run install first' 85
+  # Rotation does not reach backwards. Archives already written are readable only by the key they were
+  # written for, and this command has no way to find the copies an external process has taken off this host.
+  if [ -f "$BACKUP_RECIPIENT" ] && [ "${OPENPPWR_CONFIRM_ROTATE_BACKUP_KEY:-}" != yes ]; then
+    fail 'a backup recipient already exists; replacing it does not re-encrypt existing backups, which still require the old private key. Set OPENPPWR_CONFIRM_ROTATE_BACKUP_KEY=yes to replace it' 85
+  fi
+  umask 077
+  passphrase=${OPENPPWR_BACKUP_KEY_PASSPHRASE_FILE:-}
+  if [ -n "$passphrase" ] && [ ! -r "$passphrase" ]; then fail 'OPENPPWR_BACKUP_KEY_PASSPHRASE_FILE cannot be read' 85; fi
+  work=$(mktemp -d) || fail 'cannot create a working directory' 85
+  # Holds the certificate and a round-trip probe only. The private key is written straight to its final
+  # destination and never staged anywhere else.
+  trap 'rm -rf "$work"' 0 1 2 15
+  imported=${OPENPPWR_BACKUP_KEY_IN:-}
+  if [ -n "$imported" ]; then
+    # Rebuilding a lost host: the operator brings back the key the surviving archives were written for, and
+    # this deployment adopts it rather than minting a second one that cannot read its own backup history.
+    [ -r "$imported" ] || fail 'OPENPPWR_BACKUP_KEY_IN cannot be read' 85
+    key="$imported"
+  else
+    key=${OPENPPWR_BACKUP_KEY_OUT:-}
+    [ -n "$key" ] || fail 'set OPENPPWR_BACKUP_KEY_OUT to where the new private key should be written, or OPENPPWR_BACKUP_KEY_IN to adopt one you already hold' 85
+    if [ -e "$key" ]; then fail 'OPENPPWR_BACKUP_KEY_OUT already exists; refusing to overwrite a private key' 85; fi
+    key_dir=$(dirname "$key")
+    canonical_key_dir=$(realpath "$key_dir" 2>/dev/null) || fail 'the directory named by OPENPPWR_BACKUP_KEY_OUT does not exist' 85
+    canonical_root=$(realpath "$ROOT") || fail 'cannot resolve the deployment root' 85
+    # The one rule that stops this from being theatre. `backups/` is inside $ROOT and is what leaves the
+    # host; a private key written anywhere under $ROOT would be copied off alongside the archives it opens.
+    case "$canonical_key_dir" in
+      "$canonical_root"|"$canonical_root"/*)
+        fail 'OPENPPWR_BACKUP_KEY_OUT must be outside the deployment root; a private key stored beside the backups it decrypts protects nothing' 85;;
+    esac
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$key" 2>/dev/null || { rm -f "$key"; fail 'backup key generation failed' 85; }
+    chmod 0600 "$key"
+    if [ -n "$passphrase" ]; then
+      # PKCS#8, AES-256-CBC under PBKDF2-HMAC-SHA512 at 600000 iterations. Stated explicitly rather than
+      # left to the tool: openssl's own default for this wrapper is 2048 iterations of HMAC-SHA256, which is
+      # not what anyone means by "the key file is passphrase-protected".
+      openssl pkcs8 -topk8 -in "$key" -out "$work/wrapped.pem" -v2 aes-256-cbc -v2prf hmacWithSHA512 -iter 600000 -passout "file:$passphrase" \
+        || { rm -f "$key"; fail 'backup key passphrase wrapping failed' 85; }
+      install -m 0600 "$work/wrapped.pem" "$key"
+    fi
+  fi
+  # A key this command generated and could not then make work is removed again; a key the operator brought
+  # with them is never deleted, whatever it turns out to be, because it may be the only copy of something
+  # older archives still need. Leaving a generated-but-broken key in place would also wedge the next attempt
+  # against the refusal to overwrite an existing private key.
+  discard_generated_key(){ [ -n "$imported" ] || rm -f "$key"; }
+  if [ -n "$passphrase" ]; then
+    openssl req -x509 -new -key "$key" -passin "file:$passphrase" -sha256 -days 36500 -subj '/CN=OpenPPWR backup recipient' -out "$work/recipient.pem" 2>/dev/null \
+      || { discard_generated_key; fail 'could not derive a recipient certificate from the private key; check OPENPPWR_BACKUP_KEY_PASSPHRASE_FILE' 85; }
+  else
+    openssl req -x509 -new -key "$key" -passin pass: -sha256 -days 36500 -subj '/CN=OpenPPWR backup recipient' -out "$work/recipient.pem" 2>/dev/null \
+      || { discard_generated_key; fail 'could not derive a recipient certificate from the private key; if it is passphrase-protected, set OPENPPWR_BACKUP_KEY_PASSPHRASE_FILE' 85; }
+  fi
+  # The pair is proven before anything is allowed to depend on it. A recipient whose filed private key
+  # cannot open it makes every later backup look like a success and none of them recoverable.
+  probe="$work/probe"
+  openssl rand 4096 > "$probe"
+  verified=1
+  if ! cms_encrypt "$probe" "$probe.enc" "$work/recipient.pem"; then verified=0; fi
+  if [ "$verified" = 1 ] && ! cms_decrypt "$probe.enc" "$probe.out" "$key" "$passphrase"; then verified=0; fi
+  if [ "$verified" = 1 ] && ! cmp -s "$probe" "$probe.out"; then verified=0; fi
+  if [ "$verified" != 1 ]; then
+    discard_generated_key
+    fail 'backup key verification failed: the recipient certificate and the private key did not round-trip. No recipient has been installed' 86
+  fi
+  install -m 0644 "$work/recipient.pem" "$BACKUP_RECIPIENT"
+  rm -rf "$work"; trap - 0 1 2 15
+  printf 'BACKUP_KEY_PASS recipient=%s public_key_sha256=%s roundtrip=verified adopted=%s\n' \
+    "$BACKUP_RECIPIENT" "$(recipient_fingerprint "$BACKUP_RECIPIENT")" "$([ -n "$imported" ] && echo true || echo false)"
+  if [ -z "$imported" ]; then
+    printf '%s\n' "The private key is at $key. It is the only thing that can read a backup." >&2
+    printf '%s\n' 'Copy it into the secret store you already operate and remove it from this host: it must not be' >&2
+    printf '%s\n' 'anywhere the backup copier can reach, or the encryption buys nothing.' >&2
+    printf '%s\n' 'Restore needs it back — OPENPPWR_BACKUP_PRIVATE_KEY=<path> openppwr-installer restore DIR — and so' >&2
+    printf '%s\n' 'does rollback. Losing it makes every backup permanently unreadable.' >&2
+  fi
+}
+
+backup(){
+  need_root; [ -f "$ENV_FILE" ] || fail 'not configured' 80
+  need openssl
+  # Checked before the target directory is created and before any container is touched, so a deployment with
+  # no backup key is refused outright rather than handed a plaintext archive it believes is protected. This
+  # is also what upgrade and restore hit first, since both call backup before they change anything.
+  [ -f "$BACKUP_RECIPIENT" ] || fail 'backup encryption is not configured; run: openppwr-installer backup-key init (see docs/deployment/BACKUP_RESTORE_UPGRADE.md)' 83
+  # An explicit target lets a caller (upgrade) record exactly which backup directory this call produced,
+  # rather than the caller having to guess it back out afterward.
+  target=${1:-"$BACKUP_DIR/$(date -u +%Y%m%dT%H%M%SZ)"}
+  install -d -m 0700 "$target"
+  # Resolved before anything is stopped, not after: neither reading a config value nor inspecting a volume
+  # needs the writers down, and a failure in either now fails closed before touching a running deployment
+  # rather than possibly aborting under `set -e` *after* `compose stop` with nothing left to restart it
+  # — the volume-inspect guard added below was otherwise reachable only after the writers were already
+  # down.
+  project=$(sed -n 's/^OPENPPWR_COMPOSE_PROJECT=//p' "$ENV_FILE"); volume="$project-evidence"
+  mount=$(docker volume inspect -f '{{.Mountpoint}}' "$volume")
+  # The database dump and the evidence archive were each internally consistent but not with each other:
+  # api and worker kept writing between the two, so an upload, a scan verdict or a retention deletion
+  # landing in that window produced a database row and a filesystem state that belonged to two different
+  # moments. Stopping the only writers for the width of the snapshot is
+  # the same trade `restore` already makes — a brief availability gap in exchange for a backup that is
+  # actually one point in time. `compose up -d api worker` below is unconditional, reached whether the
+  # dump succeeded or not, specifically so a failed backup does not also leave the deployment stopped.
+  compose stop api worker
+  dump_ok=1
+  # Not piped directly into gzip: /bin/sh on Debian is dash, which has no `pipefail`, so a pipeline's exit
+  # status is only ever the last command's. A failed pg_dump piped into a gzip that succeeds on an empty
+  # stream produced a checksummed, "verified" archive of nothing. Dumping to a plain file first
+  # means the dump's own exit code is checked before gzip ever runs, without letting `set -e` abort before
+  # the writers are restarted below.
+  compose exec -T postgres pg_dump -U openppwr_migrator -d openppwr --format=custom > "$target/openppwr.pgdump" || dump_ok=0
+  if [ "$dump_ok" = 1 ]; then gzip -9 "$target/openppwr.pgdump" || dump_ok=0; fi
+  if [ "$dump_ok" = 1 ]; then tar -C "$mount" -czf "$target/evidence.tar.gz" . || dump_ok=0; fi
+  compose up -d api worker
+  [ "$dump_ok" = 1 ] || fail 'database dump or evidence archive failed; api and worker have been restarted' 82
+  cp "$ENV_FILE" "$target/openppwr.env"; chmod 0600 "$target/openppwr.env"
+  # The bearer tokens bootstrap-acme returned exist in plaintext exactly once, here, and nowhere else —
+  # every table stores only their hash. Without this, a genuine disaster (the whole host, not merely the
+  # data) leaves every human identity's credential permanently unrecoverable even though the tenant's data
+  # itself was successfully restored: the operator is expected to have copied these into a secret manager
+  # already, but a backup that omitted the one file making that possible after the fact was the wrong
+  # place to first discover they hadn't. Optional: a production deployment past onboarding may
+  # have removed this file deliberately, and an older backup predates its existence.
+  if [ -f "$STATE_DIR/acme-bootstrap.json" ]; then
+    cp "$STATE_DIR/acme-bootstrap.json" "$target/acme-bootstrap.json"; chmod 0600 "$target/acme-bootstrap.json"
+  fi
+  # Every member is encrypted, including the evidence archive and the bootstrap identities — not only the
+  # environment file the register singled out. The identities file holds the bearer tokens in the only
+  # plaintext copy that exists anywhere, and the evidence archive is the customer data itself.
+  encrypted=1
+  for member in openppwr.pgdump.gz evidence.tar.gz openppwr.env acme-bootstrap.json; do
+    encrypt_backup_member "$target" "$member" || { encrypted=0; break; }
+  done
+  if [ "$encrypted" != 1 ]; then
+    rm -f "$target/openppwr.pgdump.gz" "$target/evidence.tar.gz" "$target/openppwr.env" "$target/acme-bootstrap.json"
+    fail 'backup encryption failed; every unencrypted intermediate has been removed and this directory is not a usable backup' 84
+  fi
+  fingerprint=$(recipient_fingerprint "$BACKUP_RECIPIENT")
+  # Recorded so an operator holding several keys can tell which one opens this archive without trying each
+  # in turn against a live deployment. It names a public certificate, so it discloses nothing.
+  {
+    printf 'format=openppwr-backup-2\n'
+    printf 'content_encryption=CMS AuthEnvelopedData, AES-256-GCM\n'
+    printf 'key_transport=RSA-OAEP-SHA256\n'
+    printf 'recipient_public_key_sha256=%s\n' "$fingerprint"
+  } > "$target/ENCRYPTION"
+  chmod 0600 "$target/ENCRYPTION"
+  # The manifest covers the ciphertext, which is what is actually on disk and what the off-host copier
+  # moves. It detects corruption before a restore spends effort on it; it does not, and cannot, stand in for
+  # authentication — a manifest sitting beside the file it describes proves nothing against someone who can
+  # write to the directory. That is what AES-256-GCM is for.
+  (cd "$target" && sha256sum ENCRYPTION openppwr.pgdump.gz.enc evidence.tar.gz.enc openppwr.env.enc $([ -f acme-bootstrap.json.enc ] && echo acme-bootstrap.json.enc) > SHA256SUMS && sha256sum -c SHA256SUMS)
+  printf 'BACKUP_PASS path=%s encryption=aes-256-gcm recipient_public_key_sha256=%s\n' "$target" "$fingerprint"
+}
+
+upgrade(){
+  need_root; image=${1:-}; validate_image "$image"
+  # SOURCE_ROOT is derived from $0's own location, not from any notion of "the release this image belongs
+  # to". Invoked as the documented `sudo openppwr-installer upgrade ...` — the installed copy at
+  # /usr/local/bin, which install_files() itself puts there — SOURCE_ROOT resolves to /usr, and the compose
+  # refresh below would look for /usr/deploy/community/docker-compose.yml. Checked here, before backup or
+  # any env mutation, rather than mid-upgrade: a script that has already swapped OPENPPWR_IMAGE and then
+  # dies on a missing source file leaves image and running containers disagreeing. Upgrade,
+  # like install, must be invoked from within the new release's own extracted tree
+  # (`cd openppwr-X.Y.Z && sudo ./scripts/installer/openppwr-installer upgrade ...`), not via the PATH-
+  # installed binary, precisely because it needs that release's compose file.
+  [ -f "$SOURCE_ROOT/deploy/community/docker-compose.yml" ] || fail 'run upgrade from the new release tree, not the installed copy — see docs/deployment/CLEAN_SERVER_INSTALLER.md' 45
+  # Recorded explicitly so rollback restores *this* generation's data, not whichever backup directory
+  # happens to sort last at rollback time. A backup taken for any other reason between this upgrade and a
+  # later rollback — a scheduled one, an operator's manual one — previously would have been silently
+  # preferred over the one this upgrade itself took, restoring data newer than the image being rolled back
+  # to expects.
+  upgrade_backup="$BACKUP_DIR/$(date -u +%Y%m%dT%H%M%SZ)"
+  backup "$upgrade_backup"
+  printf '%s\n' "$upgrade_backup" > "$STATE_DIR/previous-backup"; chmod 0600 "$STATE_DIR/previous-backup"
+  cp "$ENV_FILE" "$STATE_DIR/previous.env"; chmod 0600 "$STATE_DIR/previous.env"
+  # A deployment configured before the worker became its own database principal (migration 022) has no
+  # OPENPPWR_WORKER_DATABASE_PASSWORD, which every image built since then requires unconditionally to run
+  # migrate. Found by upgrading a real 7-migration deployment forward to 29: migrate exited 1 with
+  # "OPENPPWR_WORKER_DATABASE_PASSWORD is required." and the operator would otherwise have to hand-edit a
+  # root-only secrets file mid-upgrade with no guidance on what value is safe to put there. The role is new,
+  # so there is no prior password to preserve — a freshly generated one is exactly as correct as the one
+  # `configure` would have written had this deployment been created after migration 022.
+  if ! grep -q '^OPENPPWR_WORKER_DATABASE_PASSWORD=' "$ENV_FILE"; then
+    printf '# Osobna tozsamosc bazodanowa workera; brakowalo jej w konfiguracji sprzed migracji 022.\nOPENPPWR_WORKER_DATABASE_PASSWORD=%s\n' "$(secret)" >> "$ENV_FILE"
+  fi
+  # The worker was not the only principal a later migration introduced, and back-filling only that one was a
+  # defect of exactly the same shape it was written to fix.
+  #
+  # Found on the reference deployment: configured before migration 014 existed, so its environment file
+  # carried OPENPPWR_DEMO_LOGIN=true and no OPENPPWR_AUTH_DATABASE_PASSWORD. Upgraded forward, it kept the
+  # flag and never gained the credential, and `prepareRuntime` then did exactly what it says it does with an
+  # absent password — `ALTER ROLE openppwr_auth NOLOGIN PASSWORD NULL`, retiring the role rather than leaving
+  # it dormant. The result was a deployment that advertised demonstration accounts and refused every attempt
+  # to use them. Nothing failed; sign-in simply stopped existing.
+  #
+  # Gated on the flag the deployment already carries, never on a default. This can only complete a profile
+  # the operator has already declared: a deployment without OPENPPWR_DEMO_LOGIN=true gains nothing here, so
+  # an upgrade can never hand a production deployment the session-issuing credential it is forbidden to hold.
+  # The generated value is a PostgreSQL role password and is unrelated to OPENPPWR_DEMO_PASSWORD, so existing
+  # demonstration accounts and their stored verifiers are untouched.
+  if grep -q '^OPENPPWR_DEMO_LOGIN=true$' "$ENV_FILE"; then
+    if ! grep -q '^OPENPPWR_AUTH_DATABASE_PASSWORD=' "$ENV_FILE"; then
+      printf '# Rola wydajaca sesje po weryfikacji hasla; brakowalo jej w konfiguracji sprzed migracji 014.\nOPENPPWR_AUTH_DATABASE_PASSWORD=%s\n' "$(secret)" >> "$ENV_FILE"
+    fi
+    if ! grep -q '^OPENPPWR_MAINTENANCE_DATABASE_PASSWORD=' "$ENV_FILE"; then
+      printf '# Rola resetu srodowiska demonstracyjnego; brakowalo jej w konfiguracji sprzed migracji 014.\nOPENPPWR_MAINTENANCE_DATABASE_PASSWORD=%s\n' "$(secret)" >> "$ENV_FILE"
+    fi
+  fi
+  # Rotation is back-filled without that gate, because `write_env_file` writes it unconditionally: every
+  # environment file this installer has produced since migration 035 has it, so its absence identifies a
+  # deployment older than the variable rather than an operator who chose to go without. Leaving it absent
+  # would silently keep the one recovery path for a leaked bearer credential closed on precisely the
+  # deployments that have been running longest.
+  if ! grep -q '^OPENPPWR_ROTATION_DATABASE_PASSWORD=' "$ENV_FILE"; then
+    printf '# Rola wymiany pojedynczego poswiadczenia; brakowalo jej w konfiguracji sprzed migracji 035.\nOPENPPWR_ROTATION_DATABASE_PASSWORD=%s\n' "$(secret)" >> "$ENV_FILE"
+  fi
+  # The PATH copy belongs to the release being installed, exactly as the compose file a few lines below
+  # does, and upgrade refreshed neither until each was found missing on a real deployment.
+  #
+  # Measured on the reference host: `/usr/local/bin/openppwr-installer` was absent while
+  # `/usr/local/bin` was on PATH, so every documented day-2 command failed with `command not found`. That
+  # deployment was installed before `install_files` copied itself onto PATH and has been upgraded since;
+  # because upgrade never wrote the copy, no amount of upgrading could ever produce it. A deployment
+  # installed after that line existed has the copy, but a stale one — the binary on PATH stayed at whatever
+  # release first installed it while the compose file, the image and the schema all moved forward, which is
+  # the more dangerous shape of the same bug: an operator running `backup` or `restore` from PATH would run
+  # the *old* release's implementation against the new release's deployment.
+  install -m 0755 "$0" /usr/local/bin/openppwr-installer
+  sed -i "s|^OPENPPWR_IMAGE=.*|OPENPPWR_IMAGE=$image|" "$ENV_FILE"
+  # The digest the deployment reports at /v1/version, refreshed with the image it now runs.
+  #
+  # Nothing set it. It was written by hand at some past deployment and never touched again, so after an
+  # upgrade `/v1/version` answered with the digest of the *previous* image — measured on the reference
+  # deployment, which reported a 0.2.0-beta.1 digest while running 1.0.0. That is worse than reporting
+  # nothing: `unknown` is honest and visibly missing, while a stale digest looks like an answer and is the
+  # one field an operator would use to prove which bytes are running.
+  #
+  # Read from the image itself rather than from the reference, because a tag is a name and the digest is
+  # the fact. A registry-backed image has a RepoDigest, which is what a puller can verify; a locally built
+  # one has only its Id, which is what this deployment can honestly claim. Failure to read either leaves
+  # the field absent rather than stale, since `unknown` is the truthful answer when it cannot be known.
+  record_image_digest "$image"
+  # The compose file being replaced belongs to exactly the generation `previous.env` above was just saved
+  # for. Saved here, before it is overwritten, so rollback can put the *pair* back together rather than the
+  # old env against the new compose file: a rollback that restored only the env left the newer compose file
+  # in place requiring variables (`OPENPPWR_WORKER_DATABASE_PASSWORD`, added a few lines above only to the
+  # live file) that a pre-upgrade `previous.env` never had, and `docker compose` refuses to even interpolate
+  # the file before anything can start. A deployment that upgraded before this line existed has no recorded
+  # compose file to roll back to — rollback documents that gap explicitly rather than silently degrading.
+  if [ -f "$COMPOSE_FILE" ]; then
+    cp "$COMPOSE_FILE" "$STATE_DIR/previous-compose.yml"; chmod 0600 "$STATE_DIR/previous-compose.yml"
+  fi
+  # `install` copies docker-compose.yml once and refuses to touch it again without an explicit overwrite
+  # confirmation, because re-running install by accident must not silently change a live topology. Upgrade
+  # is different: the operator explicitly asked to move to a new release, and every service definition,
+  # health check and credential wiring in the compose file belongs to that release, not the one first
+  # installed. Found the same way as the missing worker password above: after fixing that, the worker
+  # container still connected as openppwr_app, because the deployed compose file was still the one from
+  # `install`, which predates the worker service being wired to its own principal at all — silently
+  # reverting the entire worker/API credential separation on every upgrade until this line existed.
+  install -m 0644 "$SOURCE_ROOT/deploy/community/docker-compose.yml" "$COMPOSE_FILE"
+  compose up -d postgres clamav migrate api web worker
+  verify
+  printf 'UPGRADE_PASS image=%s rollback=restore-based\n' "$image"
+}
+
+rollback(){
+  need_root; [ -f "$STATE_DIR/previous.env" ] || fail 'no previous version state exists' 90
+  if [ -f "$STATE_DIR/previous-backup" ]; then
+    latest=$(cat "$STATE_DIR/previous-backup")
+    [ -n "$latest" ] && [ -d "$latest" ] || fail 'the backup recorded for this generation no longer exists' 91
+  else
+    # No recorded generation — a deployment that upgraded before this marker existed. Falling back to the
+    # previous, weaker heuristic (whichever backup sorts last) rather than refusing rollback outright; a
+    # deployment in this state should upgrade once more so the next rollback is exactly bound.
+    latest=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
+    [ -n "$latest" ] || fail 'no rollback backup exists' 91
+  fi
+  # Checked before the compose file is swapped, not left to restore() to discover. Rollback replaces the
+  # compose file first and restores the data second; refusing halfway through would leave the previous
+  # generation's compose file against the new generation's data, which is neither version.
+  if [ -f "$latest/openppwr.pgdump.gz.enc" ] && [ -z "${OPENPPWR_BACKUP_PRIVATE_KEY:-}" ]; then
+    fail 'the backup recorded for this generation is encrypted and OPENPPWR_BACKUP_PRIVATE_KEY is not set; nothing has been changed' 92
+  fi
+  # The compose file belongs to a generation exactly like the env and the data do. Restored before
+  # `restore()` brings services back up, so the pre-upgrade compose file and the pre-upgrade env are never
+  # mixed — a newer compose file's required variables against an older env is a `docker compose` failure at
+  # variable interpolation, before any container even starts. Absent for a deployment that upgraded before
+  # `upgrade` started recording it: rollback still proceeds, since the compose file already on disk may
+  # still be compatible, but this is recorded rather than silently assumed.
+  if [ -f "$STATE_DIR/previous-compose.yml" ]; then
+    install -m 0644 "$STATE_DIR/previous-compose.yml" "$COMPOSE_FILE"
+    compose_restored=true
+  else
+    compose_restored=false
+    # Printed here, before restore runs, not only in the combined summary line at the end: the compose
+    # file already on disk may be the *new* release's, incompatible with the older env restore is about to
+    # install, and `compose up` failing under `set -e` inside restore() would otherwise exit the whole
+    # script before the final printf below ever ran — leaving services stopped with no diagnostic that
+    # ever reached the operator.
+    printf 'ROLLBACK_WARN compose_restored=false; the compose file on disk was not recorded at upgrade time and may not match the restored environment\n' >&2
+  fi
+  OPENPPWR_CONFIRM_RESTORE=yes restore "$latest" "$STATE_DIR/previous.env"
+  rm -f "$STATE_DIR/previous-backup" "$STATE_DIR/previous-compose.yml"
+  printf 'ROLLBACK_PASS backup=%s policy=restore-based compose_restored=%s\n' "$latest" "$compose_restored"
+}
+
+restore(){
+  need_root; source_dir=${1:-}; replacement_env=${2:-$ENV_FILE}
+  [ "${OPENPPWR_CONFIRM_RESTORE:-}" = yes ] || fail 'set OPENPPWR_CONFIRM_RESTORE=yes; a safety backup is created first' 100
+  # Lexical only proves the *string* stays under the backup directory, not that the directory does: `..`
+  # segments and a symlink placed below `backups` both pass a plain prefix match while resolving somewhere
+  # else entirely — and this directory's own checksum manifest is then trusted for a destructive
+  # database/evidence replacement. Canonicalised before the check and used, canonical, for
+  # every read below, so a symlink inside the directory cannot redirect anything after the check either.
+  canonical_backup_dir=$(realpath "$BACKUP_DIR") || fail 'cannot resolve the deployment backup directory' 101
+  canonical_source_dir=$(realpath "$source_dir" 2>/dev/null) || fail 'restore source does not exist' 101
+  case "$canonical_source_dir" in "$canonical_backup_dir"/*) ;; *) fail 'restore source must be below the deployment backup directory' 101;; esac
+  source_dir=$canonical_source_dir
+  (cd "$source_dir" && sha256sum -c SHA256SUMS)
+
+  restore_dump="$STATE_DIR/restore.$$.pgdump"
+  # Named unconditionally so the trap can clean it up whether or not the encrypted branch below creates it;
+  # `rm -rf` on a path that was never created succeeds.
+  staging="$STATE_DIR/restore-plaintext.$$"
+  trap 'rm -f "$restore_dump"; rm -rf "$staging"' 0 1 2 15
+
+  # Which members this restore reads from. An encrypted set is decrypted into `staging` first; a set written
+  # before encryption existed is read where it lies. Old backups must keep restoring — an upgrade that broke
+  # recovery for every deployment that already exists would be worse than the risk it closed.
+  set_dir="$source_dir"
+  if [ -f "$source_dir/openppwr.pgdump.gz.enc" ]; then
+    need openssl
+    key=${OPENPPWR_BACKUP_PRIVATE_KEY:-}
+    [ -n "$key" ] || fail 'this backup is encrypted; set OPENPPWR_BACKUP_PRIVATE_KEY to the private key matching its recipient (see ENCRYPTION in the backup directory). Nothing has been changed' 104
+    [ -r "$key" ] || fail 'OPENPPWR_BACKUP_PRIVATE_KEY cannot be read. Nothing has been changed' 104
+    key_passphrase=${OPENPPWR_BACKUP_KEY_PASSPHRASE_FILE:-}
+    if [ -n "$key_passphrase" ] && [ ! -r "$key_passphrase" ]; then fail 'OPENPPWR_BACKUP_KEY_PASSPHRASE_FILE cannot be read. Nothing has been changed' 104; fi
+    umask 077
+    rm -rf "$staging"; install -d -m 0700 "$staging"
+    # Every member is decrypted here, before the safety backup and before a single container is stopped, so
+    # a missing, wrong or passphrase-locked key is a refusal against an untouched deployment rather than a
+    # database that has already been dropped. This is the whole reason decryption is not done inline below.
+    for member in openppwr.pgdump.gz evidence.tar.gz openppwr.env acme-bootstrap.json; do
+      [ -f "$source_dir/$member.enc" ] || continue
+      cms_decrypt "$source_dir/$member.enc" "$staging/$member" "$key" "$key_passphrase" \
+        || fail "cannot decrypt $member.enc: the private key does not match this backup's recipient, its passphrase is wrong, or the archive has been altered. Nothing has been changed" 105
+      chmod 0600 "$staging/$member"
+    done
+    [ -f "$staging/openppwr.pgdump.gz" ] && [ -f "$staging/evidence.tar.gz" ] && [ -f "$staging/openppwr.env" ] \
+      || fail 'the encrypted backup is missing a required member. Nothing has been changed' 105
+    set_dir="$staging"
+  elif [ ! -f "$source_dir/openppwr.pgdump.gz" ]; then
+    fail 'the restore source contains no database dump. Nothing has been changed' 105
+  fi
+
+  backup
+  compose stop api worker web
+  # Decompressed to a plain file first, not piped, for the same reason as `backup`'s dump side: dash has no
+  # `pipefail`, so a failed `gzip -dc` feeding a `pg_restore` that then does nothing on empty input would
+  # report success from the pipeline's last command regardless. This way `set -e` catches gzip's
+  # own exit code before pg_restore ever runs, on a file rather than a live stream.
+  gzip -dc "$set_dir/openppwr.pgdump.gz" > "$restore_dump"
+  compose exec -T postgres pg_restore -U openppwr_migrator -d openppwr --clean --if-exists --no-owner < "$restore_dump"
+  rm -f "$restore_dump"
+  project=$(sed -n 's/^OPENPPWR_COMPOSE_PROJECT=//p' "$ENV_FILE"); volume="$project-evidence"; mount=$(docker volume inspect -f '{{.Mountpoint}}' "$volume")
+  safe_mount=$(docker volume inspect -f '{{.Mountpoint}}' "$volume")
+  case "$mount" in /var/lib/docker/volumes/"$volume"/_data) ;; *) fail 'evidence volume target validation failed' 102;; esac
+  [ "$mount" = "$safe_mount" ] || fail 'evidence volume target changed during validation' 102
+  find "$mount" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  tar -C "$mount" -xzf "$set_dir/evidence.tar.gz"
+  if [ "$replacement_env" != "$ENV_FILE" ]; then cp "$replacement_env" "$ENV_FILE"; fi
+  # The worker's bearer token is application data — its hash lives in the `identities` row this restore
+  # just brought back — not a database role credential. A plain `restore <dir>` (the one-argument form
+  # this is documented with) intentionally leaves database role passwords alone, since pg_dump/pg_restore
+  # never touch role passwords and the live roles already hold whatever `configure` most recently set. But
+  # that same reasoning silently starves the worker: if this deployment was configured fresh before this
+  # restore (disaster recovery, not an in-place repair), $ENV_FILE still carries `UNCONFIGURED`, and the
+  # restored data's actual token hash matches neither an unconfigured placeholder nor a still-unknown
+  # future bootstrap token. Found by rehearsing recovery on a genuinely fresh host: the worker crash-looped
+  # on OPENPPWR_WEAK_SECRET forever, because nothing in the documented restore procedure ever re-derives
+  # the one credential that travels with the data rather than with the deployment.
+  backup_worker_token=$(grep '^OPENPPWR_WORKER_TOKEN=' "$set_dir/openppwr.env" 2>/dev/null | cut -d= -f2- | tr -d '\r')
+  if [ -n "$backup_worker_token" ] && [ "$backup_worker_token" != UNCONFIGURED ]; then
+    sed -i "s|^OPENPPWR_WORKER_TOKEN=.*|OPENPPWR_WORKER_TOKEN=$backup_worker_token|" "$ENV_FILE"
+  fi
+  chmod 0600 "$ENV_FILE"
+  # The human bearer tokens this backup carries — restored so `credentials` can still show them
+  # after a genuine disaster, exactly as it could before the host was lost. Optional: not every backup has
+  # one, and a production deployment past onboarding may have removed the file deliberately — restoring
+  # nothing in that case is correct, not a gap.
+  if [ -f "$set_dir/acme-bootstrap.json" ]; then
+    cp "$set_dir/acme-bootstrap.json" "$STATE_DIR/acme-bootstrap.json"; chmod 0600 "$STATE_DIR/acme-bootstrap.json"
+  fi
+  compose up -d postgres clamav migrate api web worker
+  verify
+  printf 'RESTORE_PASS source=%s pre_restore_backup=true\n' "$source_dir"
+}
+
+credentials(){
+  need_root
+  response="$STATE_DIR/acme-bootstrap.json"
+  [ -f "$response" ] || fail 'no bootstrap identities exist; run bootstrap-acme first' 110
+  [ -s "$response" ] || fail 'bootstrap identities file is empty; the tenant cannot be recovered without a database reset' 111
+  # Deliberately explicit. Every other command keeps tokens off the terminal (`tokens_printed=false`),
+  # because they are bearer credentials. Without this command the operator has no supported way to
+  # read them at all, so the deployment is unusable by the person who installed it — the sign-in
+  # screen tells the user to ask the operator, and the operator had nowhere to look.
+  if [ "${OPENPPWR_SHOW_CREDENTIALS:-}" != yes ]; then
+    printf '%s\n' 'Refusing to print bearer credentials without explicit confirmation.' >&2
+    printf '%s\n' 'These grant full access to the tenant. One that has been seen is replaced through' >&2
+    printf '%s\n' 'POST /v1/identities/<id>/rotate-credential, not by resetting the database.' >&2
+    printf '%s\n' 'Re-run with OPENPPWR_SHOW_CREDENTIALS=yes when nobody can see the terminal.' >&2
+    exit 112
+  fi
+  image=$(sed -n 's/^OPENPPWR_IMAGE=//p' "$ENV_FILE")
+  port=$(sed -n 's/^OPENPPWR_WEB_PORT=//p' "$ENV_FILE")
+  printf 'OpenPPWR access credentials — treat as secrets. Workbench: http://127.0.0.1:%s/en/app\n\n' "${port:-31114}"
+  docker run --rm --user 0:0 --network none --entrypoint /nodejs/bin/node -v "$STATE_DIR:/state:ro" "$image" -e "
+    const x=require('/state/acme-bootstrap.json');
+    for(const [role,identity] of Object.entries(x.identities))process.stdout.write(role.padEnd(22)+identity.token+'\n');
+  "
+  printf '\nSign in with compliance_manager for the full workflow, or read_only_auditor to look without changing anything.\n'
+  printf 'Paste the token into the credential field and press Verify.\n'
+}
+
+status(){ need_root; compose ps; }
+stop(){ need_root; compose stop; }
+uninstall(){ need_root; compose down; printf 'UNINSTALL_PASS data_preserved=true root=%s\n' "$ROOT"; }
+
+usage(){ printf '%s\n' 'usage: openppwr-installer preflight|install|verify-archive FILE SHA256|configure IMAGE|start|bootstrap SLUG NAME|bootstrap-acme|verify|credentials|backup-key init|backup-key show|journal-retention apply|journal-retention show|backup|restore DIR|upgrade IMAGE|rollback|status|stop|uninstall'; }
+
+# Lets the validator load the functions without running a command.
+[ "${OPENPPWR_INSTALLER_LIB:-}" = 1 ] && return 0 2>/dev/null
+
+command=${1:-}; [ -n "$command" ] || { usage; exit 2; }; shift
+case "$command" in
+  preflight) preflight "$@";; install) install_files "$@";; verify-archive) verify_archive "$@";; configure) configure "$@";; start) start "$@";; bootstrap) bootstrap_own "$@";; bootstrap-acme) bootstrap_acme "$@";; verify) verify "$@";; credentials) credentials "$@";; backup-key) backup_key "$@";; journal-retention) journal_retention "$@";; backup) backup "$@";; restore) restore "$@";; upgrade) upgrade "$@";; rollback) rollback "$@";; status) status "$@";; stop) stop "$@";; uninstall) uninstall "$@";; *) usage; exit 2;;
+esac

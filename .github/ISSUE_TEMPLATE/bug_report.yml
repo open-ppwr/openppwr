@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Bug report
+description: Something behaves differently from what the documentation says it does.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report a suspected security vulnerability here.** Use the private channel in
+        `SECURITY.md`. A public issue is the wrong place for a defect that has not been mitigated yet.
+
+        Everything below becomes public the moment you submit it. Remove bearer credentials, e-mail
+        addresses, customer material, hostnames and anything else that identifies your infrastructure
+        before you press the button, not afterwards.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version and revision
+      description: The version and revision reported by `GET /v1/version` on the affected deployment.
+      placeholder: curl -s http://127.0.0.1:31114/v1/version
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment shape
+      description: How this deployment was created. Behaviour differs between them.
+      options:
+        - Installer (openppwr-installer) on Debian 13 x86_64
+        - Docker Compose driven manually
+        - Local development checkout
+        - Other, described below
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+      description: State both. A report carrying only one of them cannot be triaged.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >-
+        Numbered steps, using synthetic data only. The ACME sample set that ships with the product is
+        fictional and may be used freely. Never attach real packaging, supplier or evidence material.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      description: >-
+        The smallest excerpt that shows the failure, and the correlation identifier if the interface
+        displayed one. Read it before pasting it: deployment logs carry bearer credentials, e-mail
+        addresses, file names and hostnames. Redact them.
+      render: text
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: This is not a security vulnerability. Security defects go to the private channel in SECURITY.md.
+          required: true
+        - label: Everything above uses synthetic data and names no credential, customer material or private infrastructure.
+          required: true

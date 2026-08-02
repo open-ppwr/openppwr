@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Outbound reachability for security alert routing. Apply it only if the destination you configured --
+# a webhook (OPENPPWR_ALERT_WEBHOOK_URL) or a mail relay (OPENPPWR_ALERT_SMTP_HOST) -- lives outside this
+# deployment:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.alerting.yml --env-file openppwr.env up -d
+#
+# Why it is a separate file rather than a default. The base stack puts `api` on two internal networks
+# and nothing else, so the container that serves requests has no path to the internet at all. That is a
+# deliberate property and worth more than the convenience of alerting working out of the box: an
+# attacker who reaches code execution in the request-serving container finds nowhere to send what they
+# took. Opting in makes the trade visible in the command that starts the stack.
+#
+# You do not need this file if the destination runs inside the deployment -- a collector attached to the
+# `app` network is reachable already, needs no egress, and keeps refusal metadata off the public
+# internet. That is the better shape where it is available.
+#
+# The whole stack is unaffected if this file is not applied: with an unreachable destination the API
+# still refuses what it refused, still writes the event to stdout, and counts the undelivered alert.
+services:
+  api:
+    networks: [app, data, alert-egress]
+
+networks:
+  alert-egress:
+    name: ${OPENPPWR_COMPOSE_PROJECT:-openppwr-community}-alert-egress
